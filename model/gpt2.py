@@ -1,325 +1,219 @@
 from tokenizer.gpt2 import BPE
 import torch
-from transformers import AutoModelForCausalLM
-
-
-import math
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class NewGELU(nn.Module): #necessary
+class GPT2Embedding(nn.Module):
+    def __init__(self, vocab_size, max_length, embed_dim, dropout):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_length = max_length
+        self.embed_dim = embed_dim
+
+        self.tok_embed = nn.Embedding(self.vocab_size, self.embed_dim)
+        self.pos_embed = nn.Embedding(self.max_length, self.embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+        _, seq = x.size()
+        # [B, SEQ_LENGTH]
+        x_pos = torch.arange(seq, device=x.device).unsqueeze(0)
+        x = self.tok_embed(x) + self.pos_embed(x_pos) # (B, T, D) + (1, T, D): (B, T, D)
+        # [B, SEQ_LENGTH, EMBED_DIM]
+        return self.dropout(x)
 
-class TransformerBlock(nn.Module):
-    """
-    Sort of an autoencoder: [B, T<=ML, Emb --> B, T, Emb].
-    Equips cross-attention (decoder part)
-    """
-    def __init__(self, max_length, embed_dim, ff_dim, num_heads, prenorm=True, act=NewGELU, dropout=0.1):
+class MHAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = (embed_dim // num_heads)
 
-        super(TransformerBlock, self).__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisble by num_heads"
+        # fused qkv projection:
+        self.qkv_w = nn.Linear(self.embed_dim, 3*self.embed_dim)
+        self.proj_w = nn.Linear(self.embed_dim, self.embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
+    def forward(self, x):
+        x = self.qkv_w(x)
+        qx, kx, vx = x.split(self.embed_dim, dim=2)
+        qx = qx.view(x.shape[0], -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        kx = kx.view(x.shape[0], -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        vx = vx.view(x.shape[0], -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        att_w = torch.einsum('bhqd,bhkd->bhqk', [qx, kx])/(self.head_dim ** 0.5)
+        att_w = self.dropout(F.softmax(att_w, dim=-1)) 
+        # droppin out probs why? (attn dropout)
+        out = torch.einsum('bhal,bhlv->bhav', [att_w, vx]).permute(0,2,1,3).contiguous()
+        out = out.view(x.shape[0], -1, self.num_heads * self.head_dim)
+        out = self.dropout(self.proj_w(out)) 
+        # residue dropout
+        return out
+    
+class MLPF(nn.Module):
+
+    def __init__(self, embed_dim, ff_dim, dropout):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+
+        self.emb_ff = nn.Linear(self.embed_dim, self.ff_dim)
+        self.ff_emb = nn.Linear(self.ff_dim, self.embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.emb_ff(x)
+        x = 0.5 * x * (1.0 + torch.tanh(torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * x**3)))
+        x = self.ff_emb(x)
+        x = self.dropout(x)
+        return x
+
+class GPT2Block(nn.Module):
+    def __init__(self, embed_dim, ff_dim, num_heads, dropout):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+        self.num_heads = num_heads
+
+        self.mhattn = MHAttention(embed_dim, num_heads, dropout)
+        self.mlpf = MLPF(embed_dim, ff_dim, dropout)
+
+        self.ln1 = nn.LayerNorm(self.embed_dim)
+        self.ln2 = nn.LayerNorm(self.embed_dim)
+
+    def forward(self, x):
+        x = x + self.mhattn(self.ln1(x))
+        x = x + self.mlpf(self.ln2(x))
+        return x
+
+class GPT2LMHead(nn.Module):
+    def __init__(self, embed_dim, vocab_size):
+        super().__init__()
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
+
+    def forward(self, x):
+        # [B, SEQ_LENGTH, EMBED_DIM]
+        return self.lm_head(x)
+        # [B, SEQ_LENGTH, VOCAB_SIZE]
+
+class GPT2(nn.Module):
+
+    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers, dropout):
+        super().__init__()
+        self.vocab_size = vocab_size
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
         self.num_heads = num_heads
-        self.prenorm = prenorm
-        self.act = act
-        self.dp= dropout
+        self.num_layers = num_layers
 
-        #derv:
-        self.head_size = self.embed_dim // self.num_heads
+        self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim, dropout)
 
-        #attention blocks
-        self.c_attn = nn.Linear(self.embed_dim, 3*self.embed_dim)
-        self.register_buffer(
-            "mask", 
-            torch.tril(torch.ones(self.max_length, self.max_length))
-            .view(1, 1, self.max_length, self.max_length), persistent=False)
-        self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.stack = nn.Sequential(*[GPT2Block(embed_dim, ff_dim, num_heads, dropout) for _ in range(self.num_layers)])
 
-        #feedforward blocks
-        self.mlpf = nn.Sequential(
-            nn.Linear(self.embed_dim, self.ff_dim),
-            self.act(),
-            nn.Linear(self.ff_dim, self.embed_dim),
-        )
+        self.lm_head = GPT2LMHead(self.embed_dim, self.vocab_size)
         
-        #after attn and ff blocks
-        self.dropout = nn.Dropout(self.dp) #applied to two places (effective during training only)
-
-        #depends
-        self.ln1 = nn.LayerNorm(self.embed_dim)
-        self.ln2 = nn.LayerNorm(self.embed_dim)
-
-    def attn(self, x):
-
-        batch_size, seq_length = x.shape[:2]
-
-        Q, K, V = self.c_attn(x).split(self.embed_dim, dim=2)
-
-        Q = Q.view(batch_size, -1, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-        K = K.view(batch_size, -1, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-        V = V.view(batch_size, -1, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-
-        att = torch.einsum('bhqd,bhkd->bhqk', [Q, K])/(self.head_size ** 0.5) #scaled dot produt attention
-        att = att.masked_fill(self.mask[:,:,:seq_length,:seq_length] == 0, float('-inf'))
-        att = self.dropout(F.softmax(att, dim=-1)) #just after probabilities, why tho? (attn dropout)
-
-        #Attain to the probabilities
-        out = torch.einsum('bhal,bhlv->bhav', [att, V]).permute(0,2,1,3).contiguous()
-        out = out.view(batch_size, -1, self.num_heads * self.head_size)
-        out = self.dropout(self.c_proj(out)) #projection after attending to tokens (residue dropout)
-        return out
-    
     def forward(self, x):
 
-        if self.prenorm:
-            x = x + self.attn(self.ln1(x))
-            x = x + self.mlpf(self.ln2(x))
-        else:
-            x = self.ln1(x + self.attn(x))
-            x = self.ln2(x + self.mlpf(x))
+        # [B, SEQ_LENGTH]
+        x = self.embedding(x)
+        # [B, SEQ_LENGTH, EMBED_DIM]
+        x = self.stack(x)
+        # [B, SEQ_LENGTH, EMBED_DIM]
+        x = self.lm_head(x)
+
         return x
+
+# class GPT2:
+
+#     def __init__(self):
+
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+#         model = 'gpt2'
+#         self.tokenizer = BPE.gpt2_bpe(pretrained=True)
+#         self.model = AutoModelForCausalLM.from_pretrained(model).to(self.device)
+#         self.model.eval()
+
+#         print(self.model.state_dict().keys())
+
+#     def _infer_once(self, 
+#                     prompt: str,
+#                     *,
+#                     top_k: int = 1,
+#                     T: float = 1.0
+#                 ) -> str:
+
+#         prompt_ids = self.tokenizer.encode(prompt)
+#         input_ids = torch.tensor([prompt_ids], device=self.device)
+#         # int64: [1, SEQ]
+
+#         with torch.no_grad(): 
+#             out = self.model(input_ids=input_ids, use_cache=False)
+#             # [1, SEQ, VOCAB]
+#             next_logits = out.logits[:, -1, :] 
+#             # [1, VOCAB]
+
+#         # Handle TopK (replace < cutoff with -inf so they are softmaxx to 0):
+#         topk_logits, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1])) # [1, TOPK]
+#         cutoff = topk_logits[..., -1].unsqueeze(-1) # [1, TOPK]
+#         next_logits = torch.where(next_logits < cutoff, torch.full_like(next_logits, -float("inf")), next_logits)
+
+#         # Sampling with Temp:
+#         probs = torch.softmax(next_logits / T, dim=-1)
+#         next_id = torch.multinomial(probs, num_samples=1) 
+#         # [1,1]
+
+#         return self.tokenizer.decode([next_id[0].item()])
     
+#     def generate(self, 
+#                 prompt: str,
+#                 *,
+#                 top_k: int = 1,
+#                 T: float = 1.0
+#             ) -> str:
 
-class Transformer(nn.Module):
-    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, layers, emb_dropout=0.1):
-
-        super(Transformer, self).__init__()
-        self.max_length = max_length
-
-        self.pos_embed = nn.Embedding(max_length, embed_dim)
-        self.register_buffer("pos", torch.arange(max_length), persistent=False)
-        self.tok_embed = nn.Embedding(vocab_size, embed_dim)
-        self.dropout = nn.Dropout(emb_dropout)
-    
-        self.tbs = nn.Sequential(*[TransformerBlock(max_length, embed_dim, ff_dim, num_heads) for _ in range(layers)])
-        self.ln_f = nn.LayerNorm(embed_dim)
-
-        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
-
-        self.apply(self._init_weight) #initialization for training
-
-    def _init_weight(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def configure_optimizers(self, lr):
-        """
-        Separate out parameters by their types for AdamW 
-        """
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = f'{mn}.{pn}' if mn else pn
-        
-                if pn.endswith('bias'):
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    no_decay.add(fpn)
-
-        #validate that we considered every parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0, f"parameters {inter_params} made it into both decay and no_decay sets"
-        assert len(param_dict.keys() - union_params) == 0, f"parameters {param_dict.keys() - union_params} were note separated into either decay or no_decay sets"
-
-        optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": 0.01},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0},
-        ]
-
-        from torch.optim import AdamW
-        optimizer = AdamW(optim_groups, lr=lr)
-        return optimizer
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        assert model_type in ('gpt2', 'gpt2-medium'), "please use only gpt2 or gpt2-medium, we poor"
-        vocab_size = 50257
-        max_length = 1024
-
-        config = {
-            'gpt2':         dict(embed_dim=768,  ff_dim=768*4,  num_heads=12, layers=12),
-            'gpt2-medium':  dict(embed_dim=1024, ff_dim=1024*4, num_heads=16, layers=24)
-        }[model_type]
-
-        from transformers import GPT2LMHeadModel
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        model = cls(vocab_size, max_length, **config)
-        sd = model.state_dict()
-
-        assert len(sd_hf) == len(sd), "mismatch state dict, maybe you forgot to non-persist buffers"
-
-        up = lambda i: {
-            f'transformer.h.{i}.ln_1.weight':           f'tbs.{i}.ln1.weight',
-            f'transformer.h.{i}.ln_1.bias':             f'tbs.{i}.ln1.bias',
-            f'transformer.h.{i}.attn.c_attn.weight':    f'tbs.{i}.c_attn.weight',   #conv
-            f'transformer.h.{i}.attn.c_attn.bias':      f'tbs.{i}.c_attn.bias',       
-            f'transformer.h.{i}.attn.c_proj.weight':    f'tbs.{i}.c_proj.weight',   #conv
-            f'transformer.h.{i}.attn.c_proj.bias':      f'tbs.{i}.c_proj.bias',
-            f'transformer.h.{i}.ln_2.weight':           f'tbs.{i}.ln2.weight',
-            f'transformer.h.{i}.ln_2.bias':             f'tbs.{i}.ln2.bias',
-            f'transformer.h.{i}.mlp.c_fc.weight':       f'tbs.{i}.mlpf.0.weight',   #conv
-            f'transformer.h.{i}.mlp.c_fc.bias':         f'tbs.{i}.mlpf.0.bias',
-            f'transformer.h.{i}.mlp.c_proj.weight':     f'tbs.{i}.mlpf.2.weight',   #conv
-            f'transformer.h.{i}.mlp.c_proj.bias':       f'tbs.{i}.mlpf.2.bias',
-        }
-    
-        mapping = {
-            'transformer.wpe.weight': 'pos_embed.weight',
-            'transformer.wte.weight': 'tok_embed.weight',
-            'transformer.ln_f.weight': 'ln_f.weight',
-            'transformer.ln_f.bias': 'ln_f.bias',
-            'lm_head.weight': 'lm_head.weight',
-        }
-
-        for i in range(config['layers']): mapping.update(up(i))
-        assert len(mapping.keys()) == len(sd_hf.keys()), "mismatch mapping between the models"
-
-        #conv1d checkpoints
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-
-        from tqdm import tqdm
-        print("Importing GPT")
-        for k in tqdm(sd_hf):
-            kn = mapping[k]
-            if any(k.endswith(w) for w in transposed):
-                assert sd_hf[k].shape[::-1] == sd[kn].shape;
-                with torch.no_grad():
-                    sd[kn].copy_(sd_hf[k].t())
-            else:
-                assert sd_hf[k].shape == sd[kn].shape;
-                with torch.no_grad():
-                    sd[kn].copy_(sd_hf[k])
-
-        return model
-
-    def forward(self, x, target=None):
-
-        embed = self.ln_f(self.tbs(self.dropout(self.pos_embed(self.pos[:x.shape[1]]) + self.tok_embed(x))))
-        logits = self.lm_head(embed)
-        loss = None
-        if target is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), target.view(-1), ignore_index=-1)
-        return logits, loss
-        
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, do_sample=False):
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.shape[1] <= self.max_length else idx[:, -self.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :]/temperature
-
-            if top_k is not None:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-
-            if do_sample:
-                idx_next = torch.multinomial(probs, num_samples=1)
-            else:
-                _, idx_next = torch.topk(probs, k=1, dim=-1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-class GPT2:
-
-    def __init__(self):
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = 'gpt2'
-        self.tokenizer = BPE.gpt2_bpe(pretrained=True)
-        self.model = AutoModelForCausalLM.from_pretrained(model).to(self.device)
-        self.model.eval()
-
-        print(self.model.state_dict().keys())
-
-    def _infer_once(self, 
-                    prompt: str,
-                    *,
-                    top_k: int = 1,
-                    T: float = 1.0
-                ) -> str:
-
-        prompt_ids = self.tokenizer.encode(prompt)
-        input_ids = torch.tensor([prompt_ids], device=self.device)
-        # int64: [1, SEQ]
-
-        with torch.no_grad(): 
-            out = self.model(input_ids=input_ids, use_cache=False)
-            # [1, SEQ, VOCAB]
-            next_logits = out.logits[:, -1, :] 
-            # [1, VOCAB]
-
-        # Handle TopK (replace < cutoff with -inf so they are softmaxx to 0):
-        topk_logits, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1])) # [1, TOPK]
-        cutoff = topk_logits[..., -1].unsqueeze(-1) # [1, TOPK]
-        next_logits = torch.where(next_logits < cutoff, torch.full_like(next_logits, -float("inf")), next_logits)
-
-        # Sampling with Temp:
-        probs = torch.softmax(next_logits / T, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1) 
-        # [1,1]
-
-        return self.tokenizer.decode([next_id[0].item()])
-    
-    def generate(self, 
-                prompt: str,
-                *,
-                top_k: int = 1,
-                T: float = 1.0
-            ) -> str:
-
-        new_prompt = prompt
-        while True:
-            new_tok = self._infer_once(
-                new_prompt,
-                top_k=top_k,
-                T=T
-            )
-            new_prompt += new_tok
-            print(new_tok, end="", flush=True)
+#         new_prompt = prompt
+#         while True:
+#             new_tok = self._infer_once(
+#                 new_prompt,
+#                 top_k=top_k,
+#                 T=T
+#             )
+#             new_prompt += new_tok
+#             print(new_tok, end="", flush=True)
 
 if __name__ == "__main__":
-    
-    # gpt2 = GPT2()
 
-    # prompt = "Suck my dick"
+    tokenizer = BPE.gpt2_bpe(pretrained=True)
+
+    vocab_size = 50257
+    max_length = 1024
+    embed_dim=768
+    ff_dim=768*4
+    num_heads=12
+    layers=12
+    dropout = 0.1
+
+    gpt2 = GPT2(vocab_size, max_length, embed_dim, ff_dim, num_heads, layers, dropout=0.1).to('cuda')
+
+    prompt = "Life is beautiful"
+    input_ids = torch.tensor(tokenizer.encode(prompt)).view(1, -1).to('cuda')
+
+    out = gpt2.forward(input_ids)
+    print(out.shape)
+
     # print(prompt, end='', flush=True)
     # gpt2.generate(prompt, top_k=100, T=1.0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
-    prompt = "The answer to life, universe and everything is"
-    model_type = 'gpt2'
+    # prompt = "The answer to life, universe and everything is"
+    # model_type = 'gpt2'
     
-    model = Transformer.from_pretrained(model_type)
-    model.to(device)
-    model.eval()
-    import tiktoken
-    tokenizer = tiktoken.get_encoding("gpt2")
-    indices = torch.tensor(tokenizer.encode(prompt)).view(1, -1).to(device)
-    out = model.generate(indices, 100, do_sample=True)
-    print(tokenizer.decode(out.detach().tolist()[0]))
+    # model = Transformer.from_pretrained(model_type)
+    # model.to(device)
+    # model.eval()
+    # import tiktoken
+    # tokenizer = tiktoken.get_encoding("gpt2")
+    # indices = torch.tensor(tokenizer.encode(prompt)).view(1, -1).to(device)
+    # out = model.generate(indices, 100, do_sample=True)
+    # print(tokenizer.decode(out.detach().tolist()[0]))
