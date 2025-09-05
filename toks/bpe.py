@@ -188,7 +188,7 @@ class BPE:
         return bytes(self.unicode_to_byte[ch] for ch in s).decode("utf-8")
 
     @classmethod
-    def gpt2_bpe(cls, pretrained=False):
+    def gpt2(cls, pretrained=False):
         
         # nice bytes kept as their own codepoints
         bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
