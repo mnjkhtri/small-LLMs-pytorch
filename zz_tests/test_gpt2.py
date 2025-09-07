@@ -19,7 +19,7 @@ def test_parity_fp32_cuda():
     ids = torch.tensor([tok.encode("The quick brown fox jumps over the lazy dog.")], device="cuda")
     with torch.no_grad():
         a = hf(ids).logits[:, -1, :].float()
-        b = my(ids)    [:, -1, :].float()
+        b = my(ids)['logits'][:, -1, :].float()
 
     diff = (a - b).abs().max().item()
     assert diff < 1e-4, f"fp32 CUDA parity failed, max diff {diff}"
@@ -34,7 +34,7 @@ def test_parity_fp16_cuda():
     ids = torch.tensor([tok.encode("The quick brown fox jumps over the lazy dog.")], device="cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         a = hf(ids).logits[:, -1, :].float()
-        b = my(ids)    [:, -1, :].float()
+        b = my(ids)['logits'][:, -1, :].float()
 
     diff = (a - b).abs().max().item()
     assert diff < 5e-1, f"fp16 CUDA parity failed, max diff {diff}"
@@ -47,6 +47,6 @@ def test_bf16_smokes_cuda():
 
     ids = torch.tensor([tok.encode("bf16 smokes test!")], device="cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        out = my(ids)
+        out = my(ids)['logits']
 
     assert torch.isfinite(out.float()).all(), "nan or inf in bf16 logits"
