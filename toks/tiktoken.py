@@ -2,6 +2,7 @@ import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from pathlib import Path
 import requests
+import os
 
 
 class Tiktoken:
@@ -41,13 +42,15 @@ class Tiktoken:
 
     @classmethod
     def llama3(cls):
-        TOKENIZER_URL = "https://paddlenlp.bj.bcebos.com/models/community/meta-llama/Llama-3.2-1B/tokenizer.model"
+        TOKENIZER_URL = "https://huggingface.co/meta-llama/llama-3.2-1b/resolve/main/original/tokenizer.model"
         save_path = Path("weights_cache") / "llama-3.2-1b"
         save_path.mkdir(parents=True, exist_ok=True)
         model_file = save_path / "tokenizer.model"
 
+        HF_TOKEN = os.getenv('HF_TOKEN')
         if not model_file.exists():
-            r = requests.get(TOKENIZER_URL, stream=True, timeout=60)
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+            r = requests.get(TOKENIZER_URL, headers=headers, stream=True, timeout=60)
             r.raise_for_status()
             with open(model_file, "wb") as f:
                 for chunk in r.iter_content(8192):
