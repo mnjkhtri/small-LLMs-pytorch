@@ -14,7 +14,7 @@ def test_parity_fp32_cuda():
 
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
     hf  = GPT2LMHeadModel.from_pretrained("gpt2").eval().to("cuda", dtype=torch.float32)
-    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.float32).to('cuda').eval()
+    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.float32, device='cuda').eval()
 
     ids = torch.tensor([tok.encode("The quick brown fox jumps over the lazy dog.")], device="cuda")
     with torch.no_grad():
@@ -29,7 +29,7 @@ def test_parity_fp16_cuda():
 
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
     hf  = GPT2LMHeadModel.from_pretrained("gpt2").eval().to("cuda", dtype=torch.float16)
-    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.float16).to('cuda').eval()
+    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.float16, device='cuda').eval()
 
     ids = torch.tensor([tok.encode("The quick brown fox jumps over the lazy dog.")], device="cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
@@ -43,7 +43,7 @@ def test_parity_fp16_cuda():
 def test_bf16_smokes_cuda():
 
     tok = GPT2TokenizerFast.from_pretrained("gpt2")
-    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.bfloat16).to('cuda').eval()
+    my  = GPT2.from_pretrained("gpt2", torch_dtype=torch.bfloat16, device='cuda').eval()
 
     ids = torch.tensor([tok.encode("bf16 smokes test!")], device="cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
