@@ -14,6 +14,10 @@ class GPT2Embedding(nn.Module):
         self.pos_embed = nn.Embedding(self.max_length, self.embed_dim)
         self.dropout = nn.Dropout(dropout)
 
+    @property
+    def weight(self): # convenience alias
+        return self.tok_embed.weight
+
     def forward(self, x, x_pos):
         # [B, SEQ_LENGTH]
         x = self.tok_embed(x) + self.pos_embed(x_pos) # (B, T, D) + (1, T, D): (B, T, D)
@@ -21,6 +25,20 @@ class GPT2Embedding(nn.Module):
         return self.dropout(x)
         # Note: Essentially a table lookup of id to dense representation. Hence a huge matrix
 
+class GPT2LMHead(nn.Module):
+    def __init__(self, embed_dim, embedding):
+        super().__init__()
+        self.ln = nn.LayerNorm(embed_dim)
+        self.embedding = embedding
+
+    def forward(self, x):
+        # [B, SEQ_LENGTH, EMBED_DIM]
+        w = self.embedding.weight
+        x = self.ln(x)
+        out = F.linear(x, w)
+        return out
+        # [B, SEQ_LENGTH, VOCAB_SIZE]
+        
 class MHAttention(nn.Module):
     def __init__(self, max_length, embed_dim, num_heads, dropout):
         super().__init__()
@@ -34,14 +52,6 @@ class MHAttention(nn.Module):
         self.qkv_w = nn.Linear(self.embed_dim, 3*self.embed_dim)
         self.proj_w = nn.Linear(self.embed_dim, self.embed_dim)
         self.dropout = nn.Dropout(dropout)
-
-        # precreate a max mask and use necessary bits during forward
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(self.max_length, self.max_length, dtype=torch.bool))
-            .view(1, 1, self.max_length, self.max_length),
-            persistent=False
-        )
 
     def forward(self, x, past_kv=None, use_cache=False):
         """
@@ -59,17 +69,18 @@ class MHAttention(nn.Module):
         kx = kx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         vx = vx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
+        mask = torch.tril(torch.ones(self.max_length, self.max_length, dtype=torch.bool)).view(1, 1, self.max_length, self.max_length).to(x.device)
+
         if past_kv is not None:
             kp, vp = past_kv                                                # [B, H, T_past, Dh]
             T_past = kp.size(2)
             Kx = torch.cat([kp, kx], dim=2)                                 # [B, H, T_past + T_q, Dh]
             Vx = torch.cat([vp, vx], dim=2)                                 # [B, H, T_past + T_q, Dh]
-            attn_mask = self.mask[:, :, T_past:T_past+T_q, :T_past+T_q]     # [1, 1, T_q, T_past + T_q]
+            attn_mask = mask[:, :, T_past:T_past+T_q, :T_past+T_q]     # [1, 1, T_q, T_past + T_q]
         else:
             Kx, Vx = kx, vx
             T_past = 0
-            T_k = T_q
-            attn_mask = self.mask[:, :, :T_q, :T_q]                         # [1, 1, T_q, T_q]
+            attn_mask = mask[:, :, :T_q, :T_q]                         # [1, 1, T_q, T_q]
 
         att_w = torch.einsum('bhqd,bhkd->bhqk', [qx, Kx]) / (self.head_dim ** 0.5)
         # [B, H, T_q, T_past + T_q]
@@ -101,6 +112,13 @@ class MHAttention(nn.Module):
         # Each head (with its own probability distribution) produces a weighted average of value vectors (features) within its subspace.
         # Here features within single head share a distribution.
         # Intuitively, token vector is updated as if it had a dynamically generated transformation matrix [E,E] applied to it.
+        # As GNN: essentially can think of multiple parallel graphs, each head defining its own edge weights and message passing.
+        # MHA = each node vertically split, and each slice attends only to corresponding slices in other tokens.
+
+        # KV cache:
+        # for each inference the KV cache grow as O(num of layers x seq length x num heads x head dim)
+
+        # To empower kv cache inference, can does it make sense to alter the inductive bias of the model ie maybe multiple q heads share common kv head??
 
 class MLPF(nn.Module):
 
@@ -148,22 +166,6 @@ class GPT2Block(nn.Module):
             x = x + self.mlpf(self.ln2(x))
             return x
 
-class GPT2LMHead(nn.Module):
-    def __init__(self, embed_dim, vocab_size, embedding):
-        super().__init__()
-        self.ln = nn.LayerNorm(embed_dim)
-        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
-
-        # Tie weights: both modules now share the same nn.Parameter:
-        self.lm_head.weight = embedding.tok_embed.weight
-
-    def forward(self, x):
-        # [B, SEQ_LENGTH, EMBED_DIM]
-        x = self.ln(x)
-        x = self.lm_head(x)
-        return x
-        # [B, SEQ_LENGTH, VOCAB_SIZE]
-
 class GPT2(nn.Module):
 
     def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers, dropout):
@@ -176,7 +178,7 @@ class GPT2(nn.Module):
         self.num_layers = num_layers
 
         self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim, dropout)
-        self.lm_head = GPT2LMHead(self.embed_dim, self.vocab_size, self.embedding) # sending embedding to tie weights
+        self.lm_head = GPT2LMHead(self.embed_dim, self.embedding) # sending embedding to tie weights
 
         self.blocks = nn.ModuleList(
             [GPT2Block(max_length, embed_dim, ff_dim, num_heads, dropout) for _ in range(self.num_layers)]
@@ -209,7 +211,7 @@ class GPT2(nn.Module):
             return {
                 'logits': x,
                 'past_key_values': new_past_key_values
-            } 
+            }
 
         else:
             for block in self.blocks:
@@ -222,16 +224,10 @@ class GPT2(nn.Module):
             return {
                 'logits': x,
             }
-
+    
     @classmethod
     def from_pretrained(cls, model_type, *, torch_dtype=torch.float32, device="cuda"):
-        """
-        1. materialize weights from HF on CPU
-        2. allocate target parameters on GPU
-        3. parameter mapping and per tensor transfer
-        """
         
-        assert model_type in ('gpt2', 'gpt2-medium'), "please use only gpt2 or gpt2-medium, we poor"
         config = {
             'gpt2':         dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12, dropout=0.1),
             'gpt2-medium':  dict(vocab_size=50257, max_length=1024, embed_dim=1024, ff_dim=1024*4, num_heads=16, num_layers=24, dropout=0.1)
@@ -239,63 +235,48 @@ class GPT2(nn.Module):
 
         model = cls(**config).to(dtype=torch_dtype, device=device)
 
-        from transformers import GPT2LMHeadModel
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
-        # avoids materializing the whole fp32 checkpoint in memory if torch dtype if fp16
+        from .utils import download_safetensors, stream_safetensors_to_meta_model
 
+        MODEL_URL = 'https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors'
+        DIR = 'gpt2'
+
+        # 1. model file
+        model_file = download_safetensors(MODEL_URL, DIR)
+
+        # 2. meta nn module
+        with torch.device('meta'):
+            model = cls(**config)
+
+        # 3. embeddings
         embedding_map = {
-            'transformer.wte.weight':      'embedding.tok_embed.weight',
-            'transformer.wpe.weight':      'embedding.pos_embed.weight'
+            'wte.weight':      'embedding.tok_embed.weight',
+            'wpe.weight':      'embedding.pos_embed.weight'
         }
-
         lm_head_map = {
-            'transformer.ln_f.weight':     'lm_head.ln.weight',
-            'transformer.ln_f.bias':       'lm_head.ln.bias'
+            'ln_f.weight':     'lm_head.ln.weight',
+            'ln_f.bias':       'lm_head.ln.bias'
         }
-
         blocks_map = lambda i: {
-            f'transformer.h.{i}.ln_1.weight':           f'blocks.{i}.ln1.weight',
-            f'transformer.h.{i}.ln_1.bias':             f'blocks.{i}.ln1.bias',
-            f'transformer.h.{i}.attn.c_attn.weight':    f'blocks.{i}.mhattn.qkv_w.weight',
-            f'transformer.h.{i}.attn.c_attn.bias':      f'blocks.{i}.mhattn.qkv_w.bias',
-            f'transformer.h.{i}.attn.c_proj.weight':    f'blocks.{i}.mhattn.proj_w.weight',
-            f'transformer.h.{i}.attn.c_proj.bias':      f'blocks.{i}.mhattn.proj_w.bias',
-            f'transformer.h.{i}.ln_2.weight':           f'blocks.{i}.ln2.weight',
-            f'transformer.h.{i}.ln_2.bias':             f'blocks.{i}.ln2.bias',
-            f'transformer.h.{i}.mlp.c_fc.weight':       f'blocks.{i}.mlpf.emb_ff.weight',
-            f'transformer.h.{i}.mlp.c_fc.bias':         f'blocks.{i}.mlpf.emb_ff.bias',
-            f'transformer.h.{i}.mlp.c_proj.weight':     f'blocks.{i}.mlpf.ff_emb.weight',
-            f'transformer.h.{i}.mlp.c_proj.bias':       f'blocks.{i}.mlpf.ff_emb.bias'
+            f'h.{i}.ln_1.weight':           f'blocks.{i}.ln1.weight',
+            f'h.{i}.ln_1.bias':             f'blocks.{i}.ln1.bias',
+            f'h.{i}.attn.c_attn.weight':    f'blocks.{i}.mhattn.qkv_w.weight',
+            f'h.{i}.attn.c_attn.bias':      f'blocks.{i}.mhattn.qkv_w.bias',
+            f'h.{i}.attn.c_proj.weight':    f'blocks.{i}.mhattn.proj_w.weight',
+            f'h.{i}.attn.c_proj.bias':      f'blocks.{i}.mhattn.proj_w.bias',
+            f'h.{i}.ln_2.weight':           f'blocks.{i}.ln2.weight',
+            f'h.{i}.ln_2.bias':             f'blocks.{i}.ln2.bias',
+            f'h.{i}.mlp.c_fc.weight':       f'blocks.{i}.mlpf.emb_ff.weight',
+            f'h.{i}.mlp.c_fc.bias':         f'blocks.{i}.mlpf.emb_ff.bias',
+            f'h.{i}.mlp.c_proj.weight':     f'blocks.{i}.mlpf.ff_emb.weight',
+            f'h.{i}.mlp.c_proj.bias':       f'blocks.{i}.mlpf.ff_emb.bias'
         }
-
         all_mappings = {**embedding_map, **lm_head_map}
         for i in range(config['num_layers']):
             all_mappings.update(blocks_map(i))
-        
-        #conv1d checkpoints
+
+        # 4. needs T if any 
         needs_T = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
-        src_params  = dict(model_hf.named_parameters())
-        tgt_params  = dict(model.named_parameters())
-
-        assert len(src_params) == len(tgt_params), "mismatch between src and tgt params"
-
-        with torch.no_grad():
-            for hf_k, our_k in all_mappings.items():
-                src = src_params.get(hf_k)
-                tgt = tgt_params.get(our_k)
-
-                assert src is not None and tgt is not None, f"missing key mapping: {hf_k}->{our_k}"
-
-                tensor = src
-                if any(hf_k.endswith(sfx) for sfx in needs_T):
-                    tensor = tensor.transpose(0, 1)
-
-                tgt.copy_(tensor.to(dtype=tgt.dtype, device=tgt.device), non_blocking=True)
-
-        del model_hf, src_params
-        import gc
-        gc.collect()
-
+        model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
         return model
     
