@@ -37,6 +37,31 @@ class Tiktoken:
     def encode(self, text, allow_special=False):
         return [self.special_tokens['<|begin_of_text|>']] + self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
 
+    def encode_instruct(self, system: str, user: str):
+
+        st = self.special_tokens
+        enc = lambda s: self.model.encode(
+            s,
+            allowed_special=set(),
+            disallowed_special=set()
+        )
+
+        toks = [st['<|begin_of_text|>']]
+
+        # System
+        toks += [st['<|start_header_id|>']] + enc("system") + [st['<|end_header_id|>']]
+        toks += enc("\n\n" + system) + [st['<|eot_id|>']]
+
+        # User
+        toks += [st['<|start_header_id|>']] + enc("user") + [st['<|end_header_id|>']]
+        toks += enc("\n\n" + user) + [st['<|eot_id|>']]
+
+        # Assistant (generation will continue from here)
+        toks += [st['<|start_header_id|>']] + enc("assistant") + [st['<|end_header_id|>']]
+        toks += enc("\n\n")
+
+        return toks
+
     def decode(self, ids):
         return self.model.decode(ids)
 
