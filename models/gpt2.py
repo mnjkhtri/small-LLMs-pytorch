@@ -226,13 +226,9 @@ class GPT2(nn.Module):
             }
     
     @classmethod
-    def from_pretrained(cls, model_type, *, torch_dtype=torch.float32, device="cuda"):
+    def from_pretrained(cls, *, torch_dtype=torch.float32, device="cuda"):
         
-        config = {
-            'gpt2':         dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12, dropout=0.1),
-            'gpt2-medium':  dict(vocab_size=50257, max_length=1024, embed_dim=1024, ff_dim=1024*4, num_heads=16, num_layers=24, dropout=0.1)
-        }[model_type]
-
+        config = dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12, dropout=0.1)
         model = cls(**config).to(dtype=torch_dtype, device=device)
 
         from .utils import download_safetensors, stream_safetensors_to_meta_model

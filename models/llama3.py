@@ -348,20 +348,18 @@ class Llama3(nn.Module):
             }
 
     @classmethod
-    def from_pretrained(cls, model_type='1b', *, torch_dtype=torch.bfloat16, device='cuda'):
+    def from_pretrained(cls, model_type='BASE', *, torch_dtype=torch.bfloat16, device='cuda'):
 
         assert device == 'cuda' and torch_dtype == torch.bfloat16, "not really tested otherwise due to gpu poor"
 
-        config = {
-            "1b": dict(
-                vocab_size=128256, max_length=8192, embed_dim=2048, ff_dim=4*2048, num_heads=32, num_kv_heads=8, num_layers=16
-            )
+        config = dict(vocab_size=128256, max_length=8192, embed_dim=2048, ff_dim=4*2048, num_heads=32, num_kv_heads=8, num_layers=16)
+
+        MODEL_URL, DIR = {
+            "BASE": ("https://huggingface.co/meta-llama/llama-3.2-1b/resolve/main/model.safetensors", "llama-3.2-1b"),
+            "INSTRUCT": ("https://huggingface.co/meta-llama/llama-3.2-1b-instruct/resolve/main/model.safetensors", "llama-3.2-1b-instruct")
         }[model_type]
 
         from .utils import download_safetensors, stream_safetensors_to_meta_model
-
-        MODEL_URL = "https://huggingface.co/meta-llama/llama-3.2-1b/resolve/main/model.safetensors"
-        DIR = "llama-3.2-1b"
 
         # 1. safetensor version of the model
         model_file = download_safetensors(MODEL_URL, DIR)
