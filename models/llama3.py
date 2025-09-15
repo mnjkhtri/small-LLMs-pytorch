@@ -199,22 +199,23 @@ class Llama3MHAttention(nn.Module):
 
         attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past)
         attn_mask = attn_mask.view(1, 1, T_q, T_past + T_q)                 # [1, 1, T_q, T_q + T_past]
-
         # [1, 1, T_q, T_past + T_q]
 
         qg = qx.reshape(B, Hkv, G, T_q, Dh)
-        # [B, H, T_q, Dh] -> [B, H_kv, G, T_q, Dh]
+        # [B, H, T_q, Dh] -> [B, Hkv, G, T_q, Dh]
 
         att_w = torch.einsum('bhgtd,bhkd->bhgtk', [qg.float(), Kx.float()]) / (Dh ** 0.5)
-        # [B, H_kv, G, T_q, Dh] @ [B, Hkv, T_past + T_q, Dh] = 
-        # [B, H_kv, G, T_q, T_k]
+        # [B, Hkv, G, T_q, Dh] @ [B, Hkv, T_past+T_q, Dh] = 
+        # [B, Hkv, G, T_q, T_past+T_q]
 
         att_w = att_w.masked_fill(~attn_mask.unsqueeze(2), torch.finfo(att_w.dtype).min)
         att_w = F.softmax(att_w, dim=-1).to(qx.dtype)
-        # [B, Hkv, G, T_q, T_k]
+        # [B, Hkv, G, T_q, T_past+T_q]
 
         ctx = torch.einsum('bhgtk,bhkd->bhgtd', [att_w, Vx])
+        # [B, Hkv, G, T_q, T_past+T_q] @ [B, Hkv, T_past+T_q, Dh] = 
         # [B, Hkv, G, T_q, Dh]
+
         out = ctx.reshape(B, H, T_q, Dh)
         # [B, H, T_q, Dh]
 
