@@ -39,7 +39,7 @@ class GPT2LMHead(nn.Module):
         return out
         # [B, SEQ_LENGTH, VOCAB_SIZE]
         
-class MHAttention(nn.Module):
+class GPT2MHAttention(nn.Module):
     def __init__(self, max_length, embed_dim, num_heads, dropout):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -120,7 +120,7 @@ class MHAttention(nn.Module):
 
         # To empower kv cache inference, can does it make sense to alter the inductive bias of the model ie maybe multiple q heads share common kv head??
 
-class MLPF(nn.Module):
+class GPT2MLPF(nn.Module):
 
     def __init__(self, embed_dim, ff_dim, dropout):
         super().__init__()
@@ -149,8 +149,8 @@ class GPT2Block(nn.Module):
         self.ff_dim = ff_dim
         self.num_heads = num_heads
 
-        self.mhattn = MHAttention(self.max_length, self.embed_dim, self.num_heads, dropout)
-        self.mlpf = MLPF(self.embed_dim, self.ff_dim, dropout)
+        self.mhattn = GPT2MHAttention(self.max_length, self.embed_dim, self.num_heads, dropout)
+        self.mlpf = GPT2MLPF(self.embed_dim, self.ff_dim, dropout)
 
         self.ln1 = nn.LayerNorm(self.embed_dim)
         self.ln2 = nn.LayerNorm(self.embed_dim)

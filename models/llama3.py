@@ -1,21 +1,7 @@
-import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import requests
-from pathlib import Path
-from tqdm import tqdm
-from safetensors import safe_open
-import gc
-from huggingface_hub import hf_hub_download
-import os
-import math
-
-
-import torch
-import math
-from typing import Optional
-
 
 
 class Llama3Embedding(nn.Module):
@@ -48,7 +34,7 @@ class Llama3LMHead(nn.Module):
         return out
         # [B, SEQ_LENGTH, VOCAB_SIZE]
 
-class MHAttention(nn.Module):
+class Llama3MHAttention(nn.Module):
 
     def __init__(self, max_length, embed_dim, num_heads, num_kv_heads):
         super().__init__()
@@ -178,8 +164,8 @@ class MHAttention(nn.Module):
         sin = sin.unsqueeze(unsqueeze_dim)
         # Even tho q has H heads and k has Hkv heads. This works due to broadcast.
         # [B, 1, T, Hdim]
-        q_embed = (q * cos) + (MHAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (MHAttention._rotate_half(k) * sin)
+        q_embed = (q * cos) + (Llama3MHAttention._rotate_half(q) * sin)
+        k_embed = (k * cos) + (Llama3MHAttention._rotate_half(k) * sin)
         return q_embed, k_embed
 
     def forward(self, x, past_kv=None, use_cache=False):
@@ -200,8 +186,8 @@ class MHAttention(nn.Module):
         position_ids = torch.arange(T_past, T_past + T_q, device=qx.device)   # [T_q]
         position_ids = position_ids.unsqueeze(0).expand(B, -1)                # [B, T_q]
 
-        cos, sin = MHAttention._rope_cos_sin(Dh, self.rope, position_ids=position_ids, device=qx.device, dtype=qx.dtype)
-        qx, kx = MHAttention.apply_rotary_pos_emb(qx, kx, cos, sin)
+        cos, sin = Llama3MHAttention._rope_cos_sin(Dh, self.rope, position_ids=position_ids, device=qx.device, dtype=qx.dtype)
+        qx, kx = Llama3MHAttention.apply_rotary_pos_emb(qx, kx, cos, sin)
         # [B, H, T_q, Dh], [B, Hkv, T_q, Dh]
 
         if past_kv is not None:
@@ -245,7 +231,7 @@ class MHAttention(nn.Module):
         
         return out
         
-class MLPF(nn.Module):
+class Llama3MLPF(nn.Module):
 
     def __init__(self, embed_dim, ff_dim):
         super().__init__()
@@ -272,8 +258,8 @@ class Llama3Block(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
 
-        self.mhattn = MHAttention(self.max_length, self.embed_dim, self.num_heads, self.num_kv_heads)
-        self.mlpf = MLPF(self.embed_dim, self.ff_dim)
+        self.mhattn = Llama3MHAttention(self.max_length, self.embed_dim, self.num_heads, self.num_kv_heads)
+        self.mlpf = Llama3MLPF(self.embed_dim, self.ff_dim)
 
         self.norm1 = nn.RMSNorm(embed_dim, eps=1e-5)
         self.norm2 = nn.RMSNorm(embed_dim, eps=1e-5)
