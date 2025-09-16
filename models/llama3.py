@@ -1,7 +1,83 @@
+import tiktoken
+from tiktoken.load import load_tiktoken_bpe
+from pathlib import Path
+import requests
+import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class Llama3Tiktoken:
+    def __init__(self, model_path, pat_str):
+
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        special_tokens = [
+            "<|begin_of_text|>",                # BOS (beginning of sequence) – always added at start
+            "<|end_of_text|>",                  # EOS (end of sequence) – marks end of document/output
+            "<|reserved_special_token_0|>",     # placeholder, never trained (future expansion)
+            "<|reserved_special_token_1|>",     # placeholder
+            "<|reserved_special_token_2|>",     # placeholder
+            "<|reserved_special_token_3|>",     # placeholder
+            "<|start_header_id|>",              # used in instruct/chat models: marks start of role header (e.g., user/assistant/system)
+            "<|end_header_id|>",                # used in instruct/chat models: marks end of role header
+            "<|reserved_special_token_4|>",     # another placeholder, unused
+            "<|eot_id|>",                       # end-of-turn marker (chat fine-tuning); every message ends with this
+        ] + [
+            # Remaining reserved slots: unused placeholders filling up the reserved 256-token block.
+            f"<|reserved_special_token_{i}|>"
+            for i in range(5, 256 - 5)
+        ]
+        self.special_tokens = {token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)}
+
+        self.model = tiktoken.Encoding(
+            name=Path(model_path).name,
+            pat_str=pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+    
+    def _encode(self, text, allow_special=False):
+        return [self.special_tokens['<|begin_of_text|>']] + self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
+
+    def _encode_instruct(self, user: str, system: str = "You are a helpful assistant."):
+        st = self.special_tokens
+        enc = lambda s: self.model.encode(s, allowed_special=set(), disallowed_special=set())
+        toks = [st['<|begin_of_text|>']]
+        # System
+        toks += [st['<|start_header_id|>']] + enc("system") + [st['<|end_header_id|>']]
+        toks += enc("\n\n" + system) + [st['<|eot_id|>']]
+        # User
+        toks += [st['<|start_header_id|>']] + enc("user") + [st['<|end_header_id|>']]
+        toks += enc("\n\n" + user) + [st['<|eot_id|>']]
+        # Assistant (generation will continue from here)
+        toks += [st['<|start_header_id|>']] + enc("assistant") + [st['<|end_header_id|>']]
+        toks += enc("\n\n")
+        return toks
+
+    def decode(self, ids):
+        return self.model.decode(ids)
+
+    @classmethod
+    def llama3(cls):
+        TOKENIZER_URL = "https://huggingface.co/meta-llama/llama-3.2-1b-instruct/resolve/main/original/tokenizer.model"
+        save_path = Path(".cache") / "llama-3.2-1b-instruct"
+        save_path.mkdir(parents=True, exist_ok=True)
+        model_file = save_path / "tokenizer.model"
+
+        HF_TOKEN = os.getenv('HF_TOKEN')
+        if not model_file.exists():
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+            r = requests.get(TOKENIZER_URL, headers=headers, stream=True, timeout=60)
+            r.raise_for_status()
+            with open(model_file, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+
+        pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        return cls(str(model_file), pat_str)
 
 
 class Llama3Embedding(nn.Module):
@@ -337,6 +413,8 @@ class Llama3(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type='BASE', *, torch_dtype=torch.bfloat16, device='cuda'):
 
+        assert model_type in ('BASE', 'INSTRUCT'), "only supports BASE, and INSTRUCT"
+
         assert device == 'cuda' and torch_dtype == torch.bfloat16, "not really tested otherwise due to gpu poor"
 
         config = dict(vocab_size=128256, max_length=8192, embed_dim=2048, ff_dim=4*2048, num_heads=32, num_kv_heads=8, num_layers=16)
@@ -379,4 +457,13 @@ class Llama3(nn.Module):
 
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
 
-        return model
+        # Tokenizer init:
+
+        tokenizer = Llama3Tiktoken.llama3()
+
+        if model_type == 'BASE':
+            tokenizer.encode = tokenizer._encode
+        elif model_type == 'INSTRUCT':
+            tokenizer.encode = tokenizer._encode_instruct
+
+        return tokenizer, model

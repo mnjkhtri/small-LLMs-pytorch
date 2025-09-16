@@ -1,9 +1,51 @@
-import math
+from tokenizers import Tokenizer
+from pathlib import Path
+import requests
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+class Qwen3Tokenizers:
+    def __init__(self, model_path):
+
+        self.tokenizer = Tokenizer.from_file(model_path)
+    
+    def _encode(self, text):
+        return self.tokenizer.encode(text).ids
+
+    def _encode_instruct(self, user: str, system: str = "You are a helpful assistant."):
+        im_start, im_end = "<|im_start|>", "<|im_end|>"
+        text = (
+            f"{im_start}system\n{system}{im_end}\n"
+            f"{im_start}user\n{user}{im_end}\n"
+            f"{im_start}assistant\n"
+        )
+        return self.tokenizer.encode(text).ids
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+
+    @classmethod
+    def qwen3(cls):
+        TOKENIZER_URL = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json"
+        save_path = Path(".cache") / "qwen3-0.6b-instruct"
+        save_path.mkdir(parents=True, exist_ok=True)
+        model_file = save_path / "tokenizer.json"
+
+        HF_TOKEN = os.getenv('HF_TOKEN')
+        if not model_file.exists():
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+            r = requests.get(TOKENIZER_URL, headers=headers, stream=True, timeout=60)
+            r.raise_for_status()
+            with open(model_file, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+
+        return cls(str(model_file))
+    
 class Qwen3Embedding(nn.Module):
     def __init__(self, vocab_size, embed_dim):
         super().__init__()
@@ -281,14 +323,16 @@ class Qwen3(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type='BASE', *, torch_dtype=torch.bfloat16, device='cuda'):
 
+        assert model_type in ('BASE', 'INSTRUCT'), "only supports BASE, and INSTRUCT"
+
         assert device == 'cuda' and torch_dtype == torch.bfloat16, "not really tested otherwise due to gpu poor"
 
         config = dict(vocab_size=151936, max_length=32768, embed_dim=1024, ff_dim=2736, num_heads=16, num_kv_heads=8, head_dim=128, num_layers=28)
         # head dim is not fixed by embed_dim and num_heads now. it is different, do divide and see
 
         MODEL_URL, DIR = {
-            "BASE": ("https://huggingface.co/qwen/qwen3-0.6b-base/resolve/main/model.safetensors", "qwen3-0.6b-base"),
-            "INSTRUCT": ("https://huggingface.co/qwen/qwen3-0.6b/resolve/main/model.safetensors", "qwen3-0.6b"),
+            "BASE": ("https://huggingface.co/qwen/qwen3-0.6b-base/resolve/main/model.safetensors", "qwen3-0.6b"),
+            "INSTRUCT": ("https://huggingface.co/qwen/qwen3-0.6b/resolve/main/model.safetensors", "qwen3-0.6b-instruct"),
         }[model_type]
 
         from utils import download_safetensors, stream_safetensors_to_meta_model
@@ -327,4 +371,12 @@ class Qwen3(nn.Module):
 
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
 
-        return model
+        # Tokenizer init:
+        tokenizer = Qwen3Tokenizers.qwen3()
+
+        if model_type == 'BASE':
+            tokenizer.encode = tokenizer._encode
+        elif model_type == 'INSTRUCT':
+            tokenizer.encode = tokenizer._encode_instruct
+
+        return tokenizer, model
