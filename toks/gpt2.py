@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 
-class BPE:
+class GPT2BPE:
     """
     byte_to_unicode:
     unicode_to_byte:

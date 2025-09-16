@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Llama3Embedding(nn.Module):
+class Qwen3Embedding(nn.Module):
     def __init__(self, vocab_size, embed_dim):
         super().__init__()
         self.vocab_size = vocab_size
@@ -20,10 +20,10 @@ class Llama3Embedding(nn.Module):
         return self.tok_embed(x)
         # [B, SEQ_LENGTH, EMBED_DIM]
 
-class Llama3LMHead(nn.Module):
+class Qwen3LMHead(nn.Module):
     def __init__(self, embed_dim, embedding):
         super().__init__()
-        self.norm = nn.RMSNorm(embed_dim, eps=1e-5)
+        self.norm = nn.RMSNorm(embed_dim, eps=1e-6)
         self.embedding = embedding
 
     def forward(self, x):
@@ -34,9 +34,27 @@ class Llama3LMHead(nn.Module):
         return out
         # [B, SEQ_LENGTH, VOCAB_SIZE]
 
-class Llama3MHAttention(nn.Module):
+class Qwen3MLPF(nn.Module):
 
-    def __init__(self, max_length, embed_dim, num_heads, num_kv_heads):
+    def __init__(self, embed_dim, ff_dim):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+
+        self.up_proj = nn.Linear(self.embed_dim, self.ff_dim, bias=False)
+        self.gate_proj = nn.Linear(self.embed_dim, self.ff_dim, bias=False)
+        self.down_proj = nn.Linear(self.ff_dim, self.embed_dim, bias=False)
+
+    def forward(self, x):
+        up = self.up_proj(x)
+        gate = self.gate_proj(x)
+        x = self.down_proj(up * F.silu(gate))
+        return x
+        #  SwiGLU activation
+
+class Qwen3MHAttention(nn.Module):
+
+    def __init__(self, max_length, embed_dim, num_heads, num_kv_heads, head_dim):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
@@ -45,91 +63,30 @@ class Llama3MHAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = (embed_dim // num_heads)
+        self.head_dim = head_dim
         self.group_size = (num_heads // num_kv_heads)
 
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.k_proj = nn.Linear(self.embed_dim, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, num_kv_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(self.embed_dim, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         # num_heads q share num_kv_heads kv;
 
-        self.o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
+
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=False)
 
         self.rope = {
-            "rope_theta": 500000.0,
-            "factor": 32.0,
-            "hi_freq_factor": 4.0,
-            "lo_freq_factor": 1.0,
-            "original_context_length": 8192
+            'rope_theta': 1_000_000.0
         }
 
     @staticmethod
-    def _rope_cos_sin(
-        head_dim,
-        rope,
-        position_ids,
-        device,
-        dtype,
-    ):
+    def _rope_cos_sin(head_dim, rope, position_ids, device, dtype):
         # θ_j = 1 / base^(2j/d) for j = 0, 1, ..., d/2 - 1
         theta_j = 1.0 / (rope['rope_theta'] ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float) / head_dim))
 
         # The is inverse to freq_j ∝ j (Logarithmially). So θ_j is proportional to wavelength.
         inv_freq_j = theta_j
-
-        # Their values range geometrically from:
-        #   θ_j=0       = 1                             (highest frequency, fastest subspace)
-        #   θ_j=d/2     = 1 / rope_theta                (lowest frequency,  slowest subspace)
-        # So: θ_j ∈ [1 / rope_theta, 1]
-
-        # The actual rotation angle for position m (equivalent to time) is (will be):
-        #   φ_j(m) = m * θ_j
-
-        # Effect of increasing m (example with context_len = 8192):
-        #
-        # High-frequency subspaces (θ ≈ 1):
-        # Each step in m increases φ by ~1 radian (cycle completes after 6.28 tokens, wavelen)
-        # At m = 8192, φ ≈ 8192 radians
-        # Since exp/cos/sin repeat every 2π ≈ 6.28 radians, that’s about 1304 full cycles
-        # These subspaces oscillate rapidly, capturing fine local position differences
-        #
-        # Low-frequency subspaces (θ ≈ 1 / 500_000 = 0.000002):
-        # Each step in m increases φ by only 0.000002 radians
-        # At m = 8192, φ ≈ 0.016 radians (tiny angle, ~1/400 of a full turn) (cycle completes after 3,141,593 tokens)
-        # Exp/cos/sin barely change at all across the context
-        # These subspaces evolve extremely slowly, encoding broad, long-range position
-
-        # what if context_len = 32k?
-        # HF subspace: 5100 cycles vs LF subspace: (still tiny, << 1 cycle)
-        # Positions beyond training length (e.g. 32k vs 8k) cause new aliasing patterns the model was never trained on
-        # With scaling, the cos/sin signals look statistically similar to what the model saw in training, just stretched to cover the longer sequence
-
-        # The solution: rescale θ_j by frequency band:
-        # High-frequency bands (short λ_j): Left unchanged to preserve local detail
-        # Low-frequency bands (long λ_j): Scaled down (slowed further) so they stretch smoothly over new context size
-        # Medium-frequency bands: Smoothly interpolated between the two, avoiding sharp cutoffs
-
-        factor = rope["factor"]
-        lo_freq_factor = rope["lo_freq_factor"]
-        hi_freq_factor = rope["hi_freq_factor"]
-        original_context_length = rope["original_context_length"]
-
-        wavelen = 2 * math.pi / inv_freq_j
-        # the number of tokens it takes for cos/sin in that subspace to complete one full cycle (2π radians)
-
-        wavelen_cutoff = (original_context_length / hi_freq_factor, original_context_length / lo_freq_factor)
-
-        # wavelen < 2048 means freq is TOO HIGH: as it is.
-        pass
-
-        # wavelen > 8192 means freq is TOO LOW: need to scale it up
-        inv_freq_j = torch.where(wavelen > wavelen_cutoff[1], inv_freq_j / factor, inv_freq_j)
-
-        # wavelen in [2028, 8192] is interpolation:
-        smooth_factor = (original_context_length / wavelen - lo_freq_factor) / (hi_freq_factor - lo_freq_factor)
-        smoothed_inv_freq = (1 - smooth_factor) * inv_freq_j / factor + smooth_factor * inv_freq_j
-        is_medium_freq = ~(wavelen < wavelen_cutoff[1]) * ~(wavelen > wavelen_cutoff[0])
-        inv_freq_j = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_j)
 
         # Expand for batch/seq:
         inv_freq_j = inv_freq_j[None, :, None].expand(position_ids.shape[0], -1, 1).to(device)
@@ -149,7 +106,7 @@ class Llama3MHAttention(nn.Module):
         sin = emb.sin().to(dtype=dtype)
 
         return cos, sin
-
+    
     @staticmethod
     def _rotate_half(x):
         """Rotates half the hidden dims of the input."""
@@ -164,15 +121,16 @@ class Llama3MHAttention(nn.Module):
         sin = sin.unsqueeze(unsqueeze_dim)
         # Even tho q has H heads and k has Hkv heads. This works due to broadcast.
         # [B, 1, T, Hdim]
-        q_embed = (q * cos) + (Llama3MHAttention._rotate_half(q) * sin)
-        k_embed = (k * cos) + (Llama3MHAttention._rotate_half(k) * sin)
+        q_embed = (q * cos) + (Qwen3MHAttention._rotate_half(q) * sin)
+        k_embed = (k * cos) + (Qwen3MHAttention._rotate_half(k) * sin)
         return q_embed, k_embed
-
+    
     def forward(self, x, past_kv=None, use_cache=False):
         H, Hkv = self.num_heads, self.num_kv_heads
         Demb, Dh = self.embed_dim, self.head_dim
         G = self.group_size
         B, T_q, _ = x.size()
+
         qx = self.q_proj(x)
         kx = self.k_proj(x)
         vx = self.v_proj(x)
@@ -186,8 +144,11 @@ class Llama3MHAttention(nn.Module):
         position_ids = torch.arange(T_past, T_past + T_q, device=qx.device)   # [T_q]
         position_ids = position_ids.unsqueeze(0).expand(B, -1)                # [B, T_q]
 
-        cos, sin = Llama3MHAttention._rope_cos_sin(Dh, self.rope, position_ids=position_ids, device=qx.device, dtype=qx.dtype)
-        qx, kx = Llama3MHAttention.apply_rotary_pos_emb(qx, kx, cos, sin)
+        qx = self.q_norm(qx)   # RMSNorm over Dh
+        kx = self.k_norm(kx)
+
+        cos, sin = Qwen3MHAttention._rope_cos_sin(Dh, self.rope, position_ids=position_ids, device=qx.device, dtype=qx.dtype)
+        qx, kx = Qwen3MHAttention.apply_rotary_pos_emb(qx, kx, cos, sin)
         # [B, H, T_q, Dh], [B, Hkv, T_q, Dh]
 
         if past_kv is not None:
@@ -221,10 +182,8 @@ class Llama3MHAttention(nn.Module):
 
         out = out.permute(0, 2, 1, 3).contiguous()
         # [B, T_q, H, Dh]
-        out = out.reshape(B, T_q, Demb)
-        # [B, T_q, Demb]
 
-        out = self.o_proj(out)
+        out = self.o_proj(out.reshape(B, T_q, H * Dh))
         # [B, T_q, Demb]
 
         if use_cache:
@@ -232,38 +191,22 @@ class Llama3MHAttention(nn.Module):
         
         return out
         
-class Llama3MLPF(nn.Module):
-
-    def __init__(self, embed_dim, ff_dim):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.ff_dim = ff_dim
-
-        self.up_proj = nn.Linear(self.embed_dim, self.ff_dim, bias=False)     # "up"
-        self.gate_proj = nn.Linear(self.embed_dim, self.ff_dim, bias=False)   # "gate"
-        self.down_proj = nn.Linear(self.ff_dim, self.embed_dim, bias=False)   # "down"
-
-    def forward(self, x):
-        up = self.up_proj(x)
-        gate = self.gate_proj(x)
-        x = self.down_proj(up * F.silu(gate))
-        return x
-        #  SwiGLU activation
-
-class Llama3Block(nn.Module):
-    def __init__(self, max_length, embed_dim, ff_dim, num_heads, num_kv_heads):
+class Qwen3Block(nn.Module):
+    def __init__(self, max_length, embed_dim, ff_dim, num_heads, num_kv_heads, head_dim):
         super().__init__()
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        # wait wont embed_dim and num_heads fix the head_dim? no it doesnt in Qwen3
 
-        self.mhattn = Llama3MHAttention(self.max_length, self.embed_dim, self.num_heads, self.num_kv_heads)
-        self.mlpf = Llama3MLPF(self.embed_dim, self.ff_dim)
+        self.mhattn = Qwen3MHAttention(self.max_length, self.embed_dim, self.num_heads, self.num_kv_heads, self.head_dim)
+        self.mlpf = Qwen3MLPF(self.embed_dim, self.ff_dim)
 
-        self.norm1 = nn.RMSNorm(embed_dim, eps=1e-5)
-        self.norm2 = nn.RMSNorm(embed_dim, eps=1e-5)
+        self.norm1 = nn.RMSNorm(embed_dim, eps=1e-6)
+        self.norm2 = nn.RMSNorm(embed_dim, eps=1e-6)
 
     def forward(self, x, past_kv=None, use_cache=False):
         if use_cache:
@@ -276,9 +219,9 @@ class Llama3Block(nn.Module):
             x = x + self.mlpf(self.norm2(x))
             return x
         
-class Llama3(nn.Module):
+class Qwen3(nn.Module):
 
-    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_kv_heads, num_layers):
+    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_kv_heads, head_dim, num_layers):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_length = max_length # this is not used anywhere tho due to rope scaling (gpt2 used to create fixed embeddings)
@@ -286,13 +229,14 @@ class Llama3(nn.Module):
         self.ff_dim = ff_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
         self.num_layers = num_layers
 
-        self.embedding = Llama3Embedding(self.vocab_size, self.embed_dim)
-        self.lm_head = Llama3LMHead(self.embed_dim, self.embedding) # sending embedding to tie weights
+        self.embedding = Qwen3Embedding(self.vocab_size, self.embed_dim)
+        self.lm_head = Qwen3LMHead(self.embed_dim, self.embedding) # sending embedding to tie weights
 
         self.blocks = nn.ModuleList(
-            [Llama3Block(max_length, embed_dim, ff_dim, num_heads, num_kv_heads) for _ in range(self.num_layers)]
+            [Qwen3Block(max_length, embed_dim, ff_dim, num_heads, num_kv_heads, head_dim) for _ in range(self.num_layers)]
         )
 
     def forward(self, x, past_key_values=None, use_cache=False):
@@ -339,11 +283,12 @@ class Llama3(nn.Module):
 
         assert device == 'cuda' and torch_dtype == torch.bfloat16, "not really tested otherwise due to gpu poor"
 
-        config = dict(vocab_size=128256, max_length=8192, embed_dim=2048, ff_dim=4*2048, num_heads=32, num_kv_heads=8, num_layers=16)
+        config = dict(vocab_size=151936, max_length=32768, embed_dim=1024, ff_dim=2736, num_heads=16, num_kv_heads=8, head_dim=128, num_layers=28)
+        # head dim is not fixed by embed_dim and num_heads now. it is different, do divide and see
 
         MODEL_URL, DIR = {
-            "BASE": ("https://huggingface.co/meta-llama/llama-3.2-1b/resolve/main/model.safetensors", "llama-3.2-1b"),
-            "INSTRUCT": ("https://huggingface.co/meta-llama/llama-3.2-1b-instruct/resolve/main/model.safetensors", "llama-3.2-1b-instruct")
+            "BASE": ("https://huggingface.co/qwen/qwen3-0.6b-base/resolve/main/model.safetensors", "qwen3-0.6b-base"),
+            "INSTRUCT": ("https://huggingface.co/qwen/qwen3-0.6b/resolve/main/model.safetensors", "qwen3-0.6b"),
         }[model_type]
 
         from utils import download_safetensors, stream_safetensors_to_meta_model
@@ -360,13 +305,16 @@ class Llama3(nn.Module):
             'model.embed_tokens.weight': 'embedding.tok_embed.weight',
             'model.norm.weight':         'lm_head.norm.weight'
         }
+
         blocks_map = lambda i: {
             f'model.layers.{i}.input_layernorm.weight':           f'blocks.{i}.norm1.weight',
             f'model.layers.{i}.mlp.up_proj.weight':               f'blocks.{i}.mlpf.up_proj.weight',
             f'model.layers.{i}.mlp.gate_proj.weight':             f'blocks.{i}.mlpf.gate_proj.weight',
             f'model.layers.{i}.mlp.down_proj.weight':             f'blocks.{i}.mlpf.down_proj.weight',
             f'model.layers.{i}.self_attn.q_proj.weight':          f'blocks.{i}.mhattn.q_proj.weight',
+            f'model.layers.{i}.self_attn.q_norm.weight':          f'blocks.{i}.mhattn.q_norm.weight',
             f'model.layers.{i}.self_attn.k_proj.weight':          f'blocks.{i}.mhattn.k_proj.weight',
+            f'model.layers.{i}.self_attn.k_norm.weight':          f'blocks.{i}.mhattn.k_norm.weight',
             f'model.layers.{i}.self_attn.v_proj.weight':          f'blocks.{i}.mhattn.v_proj.weight',
             f'model.layers.{i}.self_attn.o_proj.weight':          f'blocks.{i}.mhattn.o_proj.weight',
             f'model.layers.{i}.post_attention_layernorm.weight':  f'blocks.{i}.norm2.weight',

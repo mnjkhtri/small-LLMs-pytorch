@@ -231,7 +231,7 @@ class GPT2(nn.Module):
         config = dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12, dropout=0.1)
         model = cls(**config).to(dtype=torch_dtype, device=device)
 
-        from .utils import download_safetensors, stream_safetensors_to_meta_model
+        from utils import download_safetensors, stream_safetensors_to_meta_model
 
         MODEL_URL = 'https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors'
         DIR = 'gpt2'
