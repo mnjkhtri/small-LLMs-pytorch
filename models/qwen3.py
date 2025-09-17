@@ -200,10 +200,6 @@ class Qwen3MHAttention(nn.Module):
         else:
             Kx, Vx = kx, vx                                                 # [B, Hkv, T_q, Dh]
 
-        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past)
-        attn_mask = attn_mask.view(1, 1, T_q, T_past + T_q)                 # [1, 1, T_q, T_q + T_past]
-        # [1, 1, T_q, T_past + T_q]
-
         qg = qx.reshape(B, Hkv, G, T_q, Dh)
         # [B, H, T_q, Dh] -> [B, Hkv, G, T_q, Dh]
 
@@ -211,6 +207,8 @@ class Qwen3MHAttention(nn.Module):
         # [B, Hkv, G, T_q, Dh] @ [B, Hkv, T_past+T_q, Dh] = 
         # [B, Hkv, G, T_q, T_past+T_q]
 
+        # Oh no we shouldnt have attended all the toks only casual ones?
+        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, T_q, T_past + T_q)
         att_w = att_w.masked_fill(~attn_mask.unsqueeze(2), torch.finfo(att_w.dtype).min)
         att_w = F.softmax(att_w, dim=-1).to(qx.dtype)
         # [B, Hkv, G, T_q, T_past+T_q]
