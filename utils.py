@@ -8,7 +8,7 @@ import gc
 
 
 def download_safetensors(url, dir):
-    save_path = Path("weights_cache") / dir
+    save_path = Path(".cache") / dir
     save_path.mkdir(parents=True, exist_ok=True)
     model_file = save_path / "model.safetensors"
     HF_TOKEN = os.getenv('HF_TOKEN')

@@ -45,7 +45,23 @@ class Qwen3Tokenizers:
                         f.write(chunk)
 
         return cls(str(model_file))
-    
+
+class Qwen3RMSNorm(torch.nn.Module):
+    def __init__(self, emb_dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x):
+        dtype = x.dtype
+        y = F.rms_norm(
+            x.float(),
+            (self.weight.numel(),),
+            weight=self.weight.float(),
+            eps=self.eps,
+        )
+        return y.to(dtype)
+
 class Qwen3Embedding(nn.Module):
     def __init__(self, vocab_size, embed_dim):
         super().__init__()
@@ -65,7 +81,7 @@ class Qwen3Embedding(nn.Module):
 class Qwen3LMHead(nn.Module):
     def __init__(self, embed_dim, embedding):
         super().__init__()
-        self.norm = nn.RMSNorm(embed_dim, eps=1e-6)
+        self.norm = Qwen3RMSNorm(embed_dim, eps=1e-6)
         self.embedding = embedding
 
     def forward(self, x):
@@ -113,8 +129,8 @@ class Qwen3MHAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         # num_heads q share num_kv_heads kv;
 
-        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
-        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.q_norm = Qwen3RMSNorm(head_dim, eps=1e-6)
+        self.k_norm = Qwen3RMSNorm(head_dim, eps=1e-6)
 
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=False)
 
@@ -208,8 +224,8 @@ class Qwen3MHAttention(nn.Module):
         # [B, Hkv, G, T_q, T_past+T_q]
 
         # Oh no we shouldnt have attended all the toks only casual ones?
-        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, T_q, T_past + T_q)
-        att_w = att_w.masked_fill(~attn_mask.unsqueeze(2), torch.finfo(att_w.dtype).min)
+        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, 1, T_q, T_past+T_q) # [1, 1, 1, T_q, T_past+T_q]
+        att_w = att_w.masked_fill(~attn_mask, torch.finfo(att_w.dtype).min)
         att_w = F.softmax(att_w, dim=-1).to(qx.dtype)
         # [B, Hkv, G, T_q, T_past+T_q]
 
@@ -245,8 +261,8 @@ class Qwen3Block(nn.Module):
         self.mhattn = Qwen3MHAttention(self.max_length, self.embed_dim, self.num_heads, self.num_kv_heads, self.head_dim)
         self.mlpf = Qwen3MLPF(self.embed_dim, self.ff_dim)
 
-        self.norm1 = nn.RMSNorm(embed_dim, eps=1e-6)
-        self.norm2 = nn.RMSNorm(embed_dim, eps=1e-6)
+        self.norm1 = Qwen3RMSNorm(embed_dim, eps=1e-6)
+        self.norm2 = Qwen3RMSNorm(embed_dim, eps=1e-6)
 
     def forward(self, x, past_kv=None, use_cache=False):
         if use_cache:

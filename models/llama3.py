@@ -281,8 +281,8 @@ class Llama3MHAttention(nn.Module):
         # [B, Hkv, G, T_q, T_past+T_q]
 
         # Oh no we shouldnt have attended all the toks only casual ones?
-        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, T_q, T_past + T_q)
-        att_w = att_w.masked_fill(~attn_mask.unsqueeze(2), torch.finfo(att_w.dtype).min)
+        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, 1, T_q, T_past+T_q)  # [1, 1, 1, T_q, T_past+T_q]
+        att_w = att_w.masked_fill(~attn_mask, torch.finfo(att_w.dtype).min)
         att_w = F.softmax(att_w, dim=-1).to(qx.dtype)
         # [B, Hkv, G, T_q, T_past+T_q]
 
