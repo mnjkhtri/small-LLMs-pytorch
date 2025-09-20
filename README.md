@@ -1,3 +1,11 @@
+## implemented:
+- gpt2 tokenizer from scratch
+- gpt2 model
+- llama3
+- gemma3
+- qwen
+each supports kv caches
+
 ## gpt2 bpe tokenizer:
 
 - take text → UTF-8 bytes → map each byte to a unique Unicode stand-in (so BPE can work on them losslessly)
