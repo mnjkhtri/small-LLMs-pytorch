@@ -5,6 +5,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 
 class Qwen3Tokenizers:
@@ -110,6 +111,14 @@ class Qwen3MLPF(nn.Module):
         return x
         #  SwiGLU activation
 
+@dataclass
+class KVCache:
+    kx: torch.Tensor
+    vx: torch.Tensor
+    kv_cache_start_id: int
+    kv_cache_end_id: int
+    kv_cache_size: int
+
 class Qwen3MHAttention(nn.Module):
 
     def __init__(self, max_length, embed_dim, num_heads, num_kv_heads, head_dim):
@@ -197,10 +206,12 @@ class Qwen3MHAttention(nn.Module):
         kx = kx.view(B, T_q, Hkv, Dh).permute(0, 2, 1, 3)      # [B, Hkv, T_q, Dh]
         vx = vx.view(B, T_q, Hkv, Dh).permute(0, 2, 1, 3)      # [B, Hkv, T_q, Dh]
 
-        T_past = 0 if past_kv is None else past_kv[0].size(2)
+        kv_cache_start_id = 0 if past_kv is None else past_kv.kv_cache_start_id
+        kv_cache_end_id = 0 if past_kv is None else past_kv.kv_cache_end_id
+        kv_cache_size = 0 if past_kv is None else past_kv.kv_cache_size
 
-        position_ids = torch.arange(T_past, T_past + T_q, device=qx.device)   # [T_q]
-        position_ids = position_ids.unsqueeze(0).expand(B, -1)                # [B, T_q]
+        position_ids = torch.arange(kv_cache_end_id, kv_cache_end_id + T_q, device=qx.device)   # [T_q]
+        position_ids = position_ids.unsqueeze(0).expand(B, -1)                                  # [B, T_q]
 
         qx = self.q_norm(qx)   # RMSNorm over Dh
         kx = self.k_norm(kx)
@@ -210,9 +221,9 @@ class Qwen3MHAttention(nn.Module):
         # [B, H, T_q, Dh], [B, Hkv, T_q, Dh]
 
         if past_kv is not None:
-            kp, vp = past_kv                                                # [B, Hkv, T_past,       Dh]
-            Kx = torch.cat([kp, kx], dim=2)                                 # [B, Hkv, T_past + T_q, Dh]
-            Vx = torch.cat([vp, vx], dim=2)                                 # [B, Hkv, T_past + T_q, Dh]
+            kp, vp = past_kv.kx, past_kv.vx                                 # [B, Hkv, kv_cache_size,       Dh]
+            Kx = torch.cat([kp, kx], dim=2)                                 # [B, Hkv, kv_cache_size + T_q, Dh]
+            Vx = torch.cat([vp, vx], dim=2)                                 # [B, Hkv, kv_cache_size + T_q, Dh]
         else:
             Kx, Vx = kx, vx                                                 # [B, Hkv, T_q, Dh]
 
@@ -220,17 +231,21 @@ class Qwen3MHAttention(nn.Module):
         # [B, H, T_q, Dh] -> [B, Hkv, G, T_q, Dh]
 
         att_w = torch.einsum('bhgtd,bhkd->bhgtk', [qg.float(), Kx.float()]) / (Dh ** 0.5)
-        # [B, Hkv, G, T_q, Dh] @ [B, Hkv, T_past+T_q, Dh] = 
-        # [B, Hkv, G, T_q, T_past+T_q]
+        # [B, Hkv, G, T_q, Dh] @ [B, Hkv, kv_cache_size+T_q, Dh] = 
+        # [B, Hkv, G, T_q, kv_cache_size+T_q]
 
         # Oh no we shouldnt have attended all the toks only casual ones?
-        attn_mask = torch.ones(T_q, T_past + T_q, dtype=torch.bool, device=qx.device).tril(T_past).view(1, 1, 1, T_q, T_past+T_q) # [1, 1, 1, T_q, T_past+T_q]
+        query_positions = kv_cache_end_id + torch.arange(T_q, device=qx.device).view(T_q, 1)                                        # (T_q, 1)
+        key_positions   = torch.arange(kv_cache_start_id, kv_cache_end_id+T_q, device=qx.device).view(1, kv_cache_size+T_q)         # (1, kv_cache_size+T_q)
+        dist = query_positions - key_positions
+        attn_mask = (dist >= 0)                                                                                                     # (T_q, kv_cache_size+T_q)
+        attn_mask = attn_mask.view(1, 1, 1, T_q, kv_cache_size+T_q)
         att_w = att_w.masked_fill(~attn_mask, torch.finfo(att_w.dtype).min)
         att_w = F.softmax(att_w, dim=-1).to(qx.dtype)
-        # [B, Hkv, G, T_q, T_past+T_q]
+        # [B, Hkv, G, T_q, kv_cache_size+T_q]
 
         ctx = torch.einsum('bhgtk,bhkd->bhgtd', [att_w, Vx])
-        # [B, Hkv, G, T_q, T_past+T_q] @ [B, Hkv, T_past+T_q, Dh] = 
+        # [B, Hkv, G, T_q, kv_cache_size+T_q] @ [B, Hkv, kv_cache_size+T_q, Dh] = 
         # [B, Hkv, G, T_q, Dh]
 
         out = ctx.reshape(B, H, T_q, Dh)
@@ -243,7 +258,13 @@ class Qwen3MHAttention(nn.Module):
         # [B, T_q, Demb]
 
         if use_cache:
-            return out, (Kx, Vx)
+            return out, KVCache(
+                kx=Kx,
+                vx=Vx,
+                kv_cache_start_id=kv_cache_start_id,
+                kv_cache_end_id=kv_cache_end_id+T_q,
+                kv_cache_size=kv_cache_size+T_q
+            )
         
         return out
         
@@ -296,13 +317,6 @@ class Qwen3(nn.Module):
         )
 
     def forward(self, x, past_key_values=None, use_cache=False):
-        B, T = x.size()
-        if past_key_values is not None and past_key_values[0] is not None:
-            # K: [B, H, T_past, Dh]
-            T_past = past_key_values[0][0].size(2)
-        else:
-            T_past = 0
-
         # [B, SEQ_LENGTH]
         x = self.embedding(x)
         # [B, SEQ_LENGTH, EMBED_DIM]
