@@ -1,8 +1,8 @@
 import torch
-from models.gpt2 import GPT2
-from models.llama3 import Llama3
-from models.gemma3 import Gemma3
-from models.qwen3 import Qwen3
+from models.text2text.gpt2 import GPT2
+from models.text2text.llama3 import Llama3
+from models.text2text.gemma3 import Gemma3
+from models.text2text.qwen3 import Qwen3
 
 
 class LLM:

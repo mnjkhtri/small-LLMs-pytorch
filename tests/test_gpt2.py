@@ -1,7 +1,7 @@
 import pytest
 import torch
 from transformers import GPT2LMHeadModel
-from models.gpt2 import GPT2
+from text2text.gpt2 import GPT2
 
 def _has_cuda():
     return torch.cuda.is_available()
