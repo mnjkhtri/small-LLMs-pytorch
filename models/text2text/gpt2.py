@@ -235,95 +235,111 @@ class GPT2Embedding(nn.Module):
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.embed_dim = embed_dim
+        self.dropout = dropout
 
         self.tok_embed = nn.Embedding(self.vocab_size, self.embed_dim)
         self.pos_embed = nn.Embedding(self.max_length, self.embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(self.dropout)
 
     @property
     def weight(self): # convenience alias
         return self.tok_embed.weight
 
     def forward(self, x, x_pos):
-        # [B, SEQ_LENGTH]
-        x = self.tok_embed(x) + self.pos_embed(x_pos) # (B, T, D) + (1, T, D): (B, T, D)
-        # [B, SEQ_LENGTH, EMBED_DIM]
+
+        # [B, Tq]
+
+        x = self.tok_embed(x) + self.pos_embed(x_pos) 
+        # [B, Tq, De] + [1, Tq, D]: [B, Tq, De]
+        # [B, Tq, De]
+
         return self.dropout(x)
         # Note: Essentially a table lookup of id to dense representation. Hence a huge matrix
 
 class GPT2LMHead(nn.Module):
-    def __init__(self, embed_dim, embedding):
+    def __init__(self, embed_dim, embed_wt):
         super().__init__()
-        self.ln = nn.LayerNorm(embed_dim)
-        self.embedding = embedding
+        self.embed_dim = embed_dim
+
+        self.ln = nn.LayerNorm(self.embed_dim)
+        self.embed_wt = embed_wt
 
     def forward(self, x):
-        # [B, SEQ_LENGTH, EMBED_DIM]
-        w = self.embedding.weight
+
+        # [B, Tq, De]
+
+        w = self.embed_wt.weight
         x = self.ln(x)
         out = F.linear(x, w)
+        # [B, Tq, De]
+
         return out
-        # [B, SEQ_LENGTH, VOCAB_SIZE]
         
 class GPT2MHAttention(nn.Module):
     def __init__(self, max_length, embed_dim, num_heads, dropout):
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.dropout = dropout
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = (embed_dim // num_heads)
 
-        # fused qkv projection:
         self.qkv_w = nn.Linear(self.embed_dim, 3*self.embed_dim)
         self.proj_w = nn.Linear(self.embed_dim, self.embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(self.dropout)
 
     def forward(self, x, past_kv=None, use_cache=False):
         """
-        x: [B, T_q, C], T_q = 1 for inference (usually)
-        past_kv: (K_cache, V_cache) where K_cache, V_cache: [B, H, T_past, Dh]
+        x: [B, Tq, De], Tq = 1 for inference (usually)
+        past_kv: (K_cache, V_cache) where K_cache, V_cache: [B, H, Tpast, Dh]
         use_cache: if True, return (y, (K_total, V_total)); else return y
         """
 
+        # [B, Tq, De]
+
         B, T_q, _ = x.size()
         x = self.qkv_w(x)
-        qx, kx, vx = x.split(self.embed_dim, dim=2)
+        # [B, Tq, 3 * De]
 
-        # each [B, H, T_q, Hd]:
+        qx, kx, vx = x.split(self.embed_dim, dim=2) # each [B, Tq, De]
+
         qx = qx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         kx = kx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        vx = vx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        vx = vx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # each [B, H, Tq, Dh]
 
         mask = torch.tril(torch.ones(self.max_length, self.max_length, dtype=torch.bool)).view(1, 1, self.max_length, self.max_length).to(x.device)
 
         if past_kv is not None:
-            kp, vp = past_kv                                                # [B, H, T_past, Dh]
+            kp, vp = past_kv                                                # [B, H, Tpast, Dh]
             T_past = kp.size(2)
-            Kx = torch.cat([kp, kx], dim=2)                                 # [B, H, T_past + T_q, Dh]
-            Vx = torch.cat([vp, vx], dim=2)                                 # [B, H, T_past + T_q, Dh]
-            attn_mask = mask[:, :, T_past:T_past+T_q, :T_past+T_q]     # [1, 1, T_q, T_past + T_q]
+            Kx = torch.cat([kp, kx], dim=2)                                 # [B, H, Tpast + Tq, Dh]
+            Vx = torch.cat([vp, vx], dim=2)                                 # [B, H, Tpast + Tq, Dh]
+            attn_mask = mask[:, :, T_past:T_past+T_q, :T_past+T_q]          # [1, 1, Tq, Tpast + Tq]
         else:
             Kx, Vx = kx, vx
             T_past = 0
-            attn_mask = mask[:, :, :T_q, :T_q]                         # [1, 1, T_q, T_q]
+            attn_mask = mask[:, :, :T_q, :T_q]                              # [1, 1, Tq, Tq]
 
         att_w = torch.einsum('bhqd,bhkd->bhqk', [qx, Kx]) / (self.head_dim ** 0.5)
-        # [B, H, T_q, T_past + T_q]
+        # [B, H, Tq, Tpast + Tq]
         att_w = att_w.masked_fill(~attn_mask, torch.finfo(att_w.dtype).min)
-        # [B, H, T_q, T_past + T_q]
+        # [B, H, Tq, Tpast + Tq]
 
         att_w = F.softmax(att_w, dim=-1)
         att_w = self.dropout(att_w)
-        # [B, H, T_q, T_past + T_q]
+        # [B, H, Tq, Tpast + Tq]
         # droppin out probs why? (attn dropout)
 
         out = torch.einsum('bhal,bhlv->bhav', [att_w, Vx])
-        # [B, H, T_q, Dh]
+        # [B, H, Tq, Dh]
+
         out = out.permute(0,2,1,3).contiguous()
-        # [B, T_q, H, Dh]
+        # [B, Tq, H, Dh]
+
         out = out.view(B, -1, self.num_heads * self.head_dim)
-        # [B, T_q, Edim]
+        # [B, Tq, De]
+
         out = self.dropout(self.proj_w(out)) 
         # residue dropout
 
@@ -352,17 +368,28 @@ class GPT2MLPF(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
+        self.dropout = dropout
 
         self.emb_ff = nn.Linear(self.embed_dim, self.ff_dim)
         self.ff_emb = nn.Linear(self.ff_dim, self.embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(self.dropout)
 
     def forward(self, x):
+
+        # [B, Tq, De]
+
         x = self.emb_ff(x)
+        # [B, Tq, Df]
+
         x = F.gelu(x, approximate="tanh")
         x = self.ff_emb(x)
+        # [B, Tq, De]
+
         x = self.dropout(x)
         return x
+    
+        # [B, Tq, De]
+    
         # Note: The affine transformaiton E -> E is not very expessive. By expanding four times and compressive back learns rich features.
         # This acts like a bottleneck autoencoder
         # In a stack 2/3rd of parameters live in MLPF while rest 1/3rd is in MHA
@@ -374,14 +401,17 @@ class GPT2Block(nn.Module):
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
         self.num_heads = num_heads
+        self.dropout = dropout
 
-        self.mhattn = GPT2MHAttention(self.max_length, self.embed_dim, self.num_heads, dropout)
-        self.mlpf = GPT2MLPF(self.embed_dim, self.ff_dim, dropout)
-
+        self.mhattn = GPT2MHAttention(self.max_length, self.embed_dim, self.num_heads, self.dropout)
+        self.mlpf = GPT2MLPF(self.embed_dim, self.ff_dim, self.dropout)
         self.ln1 = nn.LayerNorm(self.embed_dim)
         self.ln2 = nn.LayerNorm(self.embed_dim)
 
     def forward(self, x, past_kv=None, use_cache=False):
+
+        # [B, Tq, De]
+
         if use_cache:
             attd_x, present_kv = self.mhattn(self.ln1(x), past_kv=past_kv, use_cache=True)
             x = x + attd_x
@@ -391,6 +421,8 @@ class GPT2Block(nn.Module):
             x = x + self.mhattn(self.ln1(x))
             x = x + self.mlpf(self.ln2(x))
             return x
+
+        # [B, Tq, De]
 
 class GPT2(nn.Module):
 
@@ -402,37 +434,46 @@ class GPT2(nn.Module):
         self.ff_dim = ff_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.dropout = dropout
 
         self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim, dropout)
-        self.lm_head = GPT2LMHead(self.embed_dim, self.embedding) # sending embedding to tie weights
+        self.lm_head = GPT2LMHead(self.embed_dim, self.embedding)
 
         self.blocks = nn.ModuleList(
-            [GPT2Block(max_length, embed_dim, ff_dim, num_heads, dropout) for _ in range(self.num_layers)]
+            [GPT2Block(self.max_length, self.embed_dim, self.ff_dim, self.num_heads, self.dropout) for _ in range(self.num_layers)]
         )
 
     def forward(self, x, past_key_values=None, use_cache=False):
+
         B, T = x.size()
+
         if past_key_values is not None and past_key_values[0] is not None:
-            # K: [B, H, T_past, Dh]
             T_past = past_key_values[0][0].size(2)
         else:
             T_past = 0
+
         assert (T + T_past) <= self.max_length, "sequence length cant exceed max length"
 
-        # [B, SEQ_LENGTH]
+        # [B, Tq]
+
         x_pos = torch.arange(T_past, T_past + T, device=x.device).unsqueeze(0)  # [1, T]
         x = self.embedding(x, x_pos=x_pos)
-        # [B, SEQ_LENGTH, EMBED_DIM]
+        # [B, Tq, De]
 
         if use_cache:
-            if past_key_values is None:
-                past_key_values = [None] * self.num_layers
+
+            if past_key_values is None: past_key_values = [None] * self.num_layers
+            # 1st inference init
+
             new_past_key_values = []
+
             for i, block in enumerate(self.blocks):
                 x, present_kv = block(x, past_kv=past_key_values[i], use_cache=True)
                 new_past_key_values.append(present_kv)
+            # [B, Tq, De]
 
             x = self.lm_head(x)
+            # [B, Tq, VOCAB_SIZE]
 
             return {
                 'logits': x,
@@ -442,10 +483,10 @@ class GPT2(nn.Module):
         else:
             for block in self.blocks:
                 x = block(x)
+            # [B, Tq, De]
 
-            # [B, SEQ_LENGTH, EMBED_DIM]
             x = self.lm_head(x)
-            # [B, SEQ_LENGTH, VOCAB_SIZE]
+            # [B, Tq, VOCAB_SIZE]
 
             return {
                 'logits': x,
