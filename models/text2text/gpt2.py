@@ -230,16 +230,15 @@ class GPT2BPE:
     
 
 class GPT2Embedding(nn.Module):
-    def __init__(self, vocab_size, max_length, embed_dim, dropout):
+    def __init__(self, vocab_size, max_length, embed_dim):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.embed_dim = embed_dim
-        self.dropout = dropout
 
         self.tok_embed = nn.Embedding(self.vocab_size, self.embed_dim)
         self.pos_embed = nn.Embedding(self.max_length, self.embed_dim)
-        self.dropout = nn.Dropout(self.dropout)
+        self.dropout = nn.Dropout(0.1)
 
     @property
     def weight(self): # convenience alias
@@ -276,18 +275,17 @@ class GPT2LMHead(nn.Module):
         return out
         
 class GPT2MHAttention(nn.Module):
-    def __init__(self, max_length, embed_dim, num_heads, dropout):
+    def __init__(self, max_length, embed_dim, num_heads):
         super().__init__()
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.dropout = dropout
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = (embed_dim // num_heads)
 
         self.qkv_w = nn.Linear(self.embed_dim, 3*self.embed_dim)
         self.proj_w = nn.Linear(self.embed_dim, self.embed_dim)
-        self.dropout = nn.Dropout(self.dropout)
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x, past_kv=None, use_cache=False):
         """
@@ -364,15 +362,14 @@ class GPT2MHAttention(nn.Module):
 
 class GPT2MLPF(nn.Module):
 
-    def __init__(self, embed_dim, ff_dim, dropout):
+    def __init__(self, embed_dim, ff_dim):
         super().__init__()
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
-        self.dropout = dropout
 
         self.emb_ff = nn.Linear(self.embed_dim, self.ff_dim)
         self.ff_emb = nn.Linear(self.ff_dim, self.embed_dim)
-        self.dropout = nn.Dropout(self.dropout)
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
 
@@ -395,16 +392,15 @@ class GPT2MLPF(nn.Module):
         # In a stack 2/3rd of parameters live in MLPF while rest 1/3rd is in MHA
 
 class GPT2Block(nn.Module):
-    def __init__(self, max_length, embed_dim, ff_dim, num_heads, dropout):
+    def __init__(self, max_length, embed_dim, ff_dim, num_heads):
         super().__init__()
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
         self.num_heads = num_heads
-        self.dropout = dropout
 
-        self.mhattn = GPT2MHAttention(self.max_length, self.embed_dim, self.num_heads, self.dropout)
-        self.mlpf = GPT2MLPF(self.embed_dim, self.ff_dim, self.dropout)
+        self.mhattn = GPT2MHAttention(self.max_length, self.embed_dim, self.num_heads)
+        self.mlpf = GPT2MLPF(self.embed_dim, self.ff_dim)
         self.ln1 = nn.LayerNorm(self.embed_dim)
         self.ln2 = nn.LayerNorm(self.embed_dim)
 
@@ -426,7 +422,7 @@ class GPT2Block(nn.Module):
 
 class GPT2(nn.Module):
 
-    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers, dropout):
+    def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_length = max_length
@@ -434,13 +430,12 @@ class GPT2(nn.Module):
         self.ff_dim = ff_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.dropout = dropout
 
-        self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim, dropout)
+        self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim)
         self.lm_head = GPT2LMHead(self.embed_dim, self.embedding)
 
         self.blocks = nn.ModuleList(
-            [GPT2Block(self.max_length, self.embed_dim, self.ff_dim, self.num_heads, self.dropout) for _ in range(self.num_layers)]
+            [GPT2Block(self.max_length, self.embed_dim, self.ff_dim, self.num_heads) for _ in range(self.num_layers)]
         )
 
     def forward(self, x, past_key_values=None, use_cache=False):
@@ -497,7 +492,7 @@ class GPT2(nn.Module):
 
         assert model_type in ('BASE'), "only supports BASE"
         
-        config = dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12, dropout=0.1)
+        config = dict(vocab_size=50257, max_length=1024, embed_dim=768,  ff_dim=768*4,  num_heads=12, num_layers=12)
         model = cls(**config).to(dtype=torch_dtype, device=device)
 
         from utils import download_safetensors, stream_safetensors_to_meta_model
@@ -543,7 +538,6 @@ class GPT2(nn.Module):
         needs_T = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
-
         tokenizer = GPT2BPE.gpt2(pretrained=True)
         return tokenizer, model
     
