@@ -361,7 +361,6 @@ class GPT2MHAttention(nn.Module):
         # To empower kv cache inference, can does it make sense to alter the inductive bias of the model ie maybe multiple q heads share common kv head??
 
 class GPT2MLPF(nn.Module):
-
     def __init__(self, embed_dim, ff_dim):
         super().__init__()
         self.embed_dim = embed_dim
@@ -421,7 +420,6 @@ class GPT2Block(nn.Module):
         # [B, Tq, De]
 
 class GPT2(nn.Module):
-
     def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers):
         super().__init__()
         self.vocab_size = vocab_size
@@ -431,8 +429,8 @@ class GPT2(nn.Module):
         self.num_heads = num_heads
         self.num_layers = num_layers
 
-        self.embedding = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim)
-        self.lm_head = GPT2LMHead(self.embed_dim, self.embedding)
+        self.embed = GPT2Embedding(self.vocab_size, self.max_length, self.embed_dim)
+        self.lm_head = GPT2LMHead(self.embed_dim, self.embed)
 
         self.blocks = nn.ModuleList(
             [GPT2Block(self.max_length, self.embed_dim, self.ff_dim, self.num_heads) for _ in range(self.num_layers)]
@@ -452,7 +450,7 @@ class GPT2(nn.Module):
         # [B, Tq]
 
         x_pos = torch.arange(T_past, T_past + T, device=x.device).unsqueeze(0)  # [1, T]
-        x = self.embedding(x, x_pos=x_pos)
+        x = self.embed(x, x_pos=x_pos)
         # [B, Tq, De]
 
         if use_cache:
@@ -538,6 +536,9 @@ class GPT2(nn.Module):
         needs_T = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
+
+        # return Tokenizer algonside:
         tokenizer = GPT2BPE.gpt2(pretrained=True)
+
         return tokenizer, model
     
