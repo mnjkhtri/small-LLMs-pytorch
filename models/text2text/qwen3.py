@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 
 
-class Qwen3Tokenizers:
+class Qwen3HFTokenizer:
     def __init__(self, model_path):
 
         self.tokenizer = Tokenizer.from_file(model_path)
@@ -400,7 +400,7 @@ class Qwen3(nn.Module):
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
 
         # Tokenizer init:
-        tokenizer = Qwen3Tokenizers.qwen3()
+        tokenizer = Qwen3HFTokenizer.qwen3()
 
         if model_type == 'BASE':
             tokenizer.encode = tokenizer._encode

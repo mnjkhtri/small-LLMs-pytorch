@@ -9,7 +9,6 @@ from torchvision import transforms
 
 
 class ViTPreprocessor:
-
     def __init__(self):
         pass
 
@@ -125,7 +124,6 @@ class ViTMHAttention(nn.Module):
         return out
 
 class ViTMLPF(nn.Module):
-
     def __init__(self, embed_dim, ff_dim):
         super().__init__()
         self.embed_dim = embed_dim
@@ -177,7 +175,6 @@ class ViTBlock(nn.Module):
         return x
 
 class ViT(nn.Module):
-
     def __init__(self, image_size, patch_size, embed_dim, ff_dim, num_heads, num_layers, no_classes):
         super().__init__()
         self.image_size = image_size
@@ -190,17 +187,17 @@ class ViT(nn.Module):
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
 
-        self.embedding = ViTEmbedding(self.image_size, self.patch_size, self.embed_dim)
+        self.embed = ViTEmbedding(self.image_size, self.patch_size, self.embed_dim)
         self.lm_head = ViTLMHead(self.embed_dim, self.no_classes)
 
         self.blocks = nn.ModuleList(
-            [ViTBlock(self.num_patches, embed_dim, ff_dim, num_heads) for _ in range(self.num_layers)]
+            [ViTBlock(self.num_patches, self.embed_dim, self.ff_dim, self.num_heads) for _ in range(self.num_layers)]
         )
 
     def forward(self, x):
         # [B, 3, IMAGE_SIZE, IMAGE_SIZE]
 
-        x = self.embedding(x)
+        x = self.embed(x)
         # [B, T+1, De]
 
         for block in self.blocks:

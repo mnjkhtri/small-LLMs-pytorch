@@ -44,7 +44,7 @@ class Gemma3Sentencepiece:
 
         return cls(str(model_file))
 
-class Gemma3Tokenizers:
+class Gemma3HFTokenizer:
     def __init__(self, model_path):
 
         self.tokenizer = Tokenizer.from_file(model_path)
@@ -454,7 +454,7 @@ class Gemma3(nn.Module):
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
 
         # Tokenizer init:
-        tokenizer = Gemma3Tokenizers.gemma3()
+        tokenizer = Gemma3HFTokenizer.gemma3()
 
         if model_type == 'BASE':
             tokenizer.encode = tokenizer._encode
