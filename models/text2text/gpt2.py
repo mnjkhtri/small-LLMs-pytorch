@@ -236,9 +236,11 @@ class GPT2Embedding(nn.Module):
         self.max_length = max_length
         self.embed_dim = embed_dim
 
+        # [vocab_size x embed_dim]
         self.tok_embed = nn.Embedding(self.vocab_size, self.embed_dim)
+
+        # [max_length x embed_dim]
         self.pos_embed = nn.Embedding(self.max_length, self.embed_dim)
-        self.dropout = nn.Dropout(0.1)
 
     @property
     def weight(self): # convenience alias
@@ -246,52 +248,44 @@ class GPT2Embedding(nn.Module):
 
     def forward(self, x, x_pos):
 
-        # [B, Tq]
+        # x = [B, Tq], x_pos  = [1, Tq]
 
-        x = self.tok_embed(x) + self.pos_embed(x_pos) 
-        # [B, Tq, De] + [1, Tq, D]: [B, Tq, De]
-        # [B, Tq, De]
-
-        return self.dropout(x)
+        x = self.tok_embed(x) + self.pos_embed(x_pos)
+        # x = [B, Tq, De] + [1, Tq, De]
+        # x = [B, Tq, De]
         # Note: Essentially a table lookup of id to dense representation. Hence a huge matrix
+        return x
 
-class GPT2LMHead(nn.Module):
-    def __init__(self, embed_dim, embed_wt):
-        super().__init__()
-        self.embed_dim = embed_dim
-
-        self.ln = nn.LayerNorm(self.embed_dim)
-        self.embed_wt = embed_wt
-
-    def forward(self, x):
-
-        # [B, Tq, De]
-
-        w = self.embed_wt.weight
-        x = self.ln(x)
-        out = F.linear(x, w)
-        # [B, Tq, De]
-
-        return out
-        
 class GPT2MHAttention(nn.Module):
     def __init__(self, max_length, embed_dim, num_heads):
         super().__init__()
         self.max_length = max_length
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        # deriv:
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = (embed_dim // num_heads)
 
+        # embed_dim -> 3 * embed_dim
         self.qkv_w = nn.Linear(self.embed_dim, 3*self.embed_dim)
+
+        # embed_dim -> embed_dim
         self.proj_w = nn.Linear(self.embed_dim, self.embed_dim)
-        self.dropout = nn.Dropout(0.1)
+
+    def _split_heads(self, x):
+        B, T, D = x.shape
+        x = x.view(B, T, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)  # [B, H, Tq, Dh]
+
+    def _merge_heads(self, x):
+        B, H, T, Dh = x.shape
+        return x.transpose(1, 2).contiguous().view(B, T, H*Dh)  # [B, Tq, De]
 
     def forward(self, x, past_kv=None, use_cache=False):
         """
         x: [B, Tq, De], Tq = 1 for inference (usually)
-        past_kv: (K_cache, V_cache) where K_cache, V_cache: [B, H, Tpast, Dh]
-        use_cache: if True, return (y, (K_total, V_total)); else return y
+        past_kv: (K_cache, V_cache) where K_cache, V_cache: [B, H, Tpast, Dh], essentially the neural memory;
+        use_cache: if True, return (y, (K_total, V_total)) else return y;
         """
 
         # [B, Tq, De]
@@ -302,9 +296,8 @@ class GPT2MHAttention(nn.Module):
 
         qx, kx, vx = x.split(self.embed_dim, dim=2) # each [B, Tq, De]
 
-        qx = qx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        kx = kx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        vx = vx.view(B, T_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # each [B, H, Tq, Dh]
+        qx, kx, vx = map(self._split_heads, (qx, kx, vx)) 
+        # each [B, H, Tq, Dh]
 
         mask = torch.tril(torch.ones(self.max_length, self.max_length, dtype=torch.bool)).view(1, 1, self.max_length, self.max_length).to(x.device)
 
@@ -325,27 +318,16 @@ class GPT2MHAttention(nn.Module):
         # [B, H, Tq, Tpast + Tq]
 
         att_w = F.softmax(att_w, dim=-1)
-        att_w = self.dropout(att_w)
         # [B, H, Tq, Tpast + Tq]
-        # droppin out probs why? (attn dropout)
 
         out = torch.einsum('bhal,bhlv->bhav', [att_w, Vx])
         # [B, H, Tq, Dh]
 
-        out = out.permute(0,2,1,3).contiguous()
-        # [B, Tq, H, Dh]
+        y = self.proj_w(self._merge_heads(out))
+        # y = [B, Tq, De]
 
-        out = out.view(B, -1, self.num_heads * self.head_dim)
-        # [B, Tq, De]
+        return (y, (Kx, Vx)) if use_cache else y
 
-        out = self.dropout(self.proj_w(out)) 
-        # residue dropout
-
-        if use_cache:
-            return out, (Kx, Vx)
-        
-        return out
-    
         # Note: Attention weights [T,T] is probability distribution over all tokens (summing to 1), telling how much to borrow from each.
         # Each output feature is a weighted average of the same feature across all tokens’ value vectors.
         # Head divides the feature space vertically.
@@ -368,7 +350,6 @@ class GPT2MLPF(nn.Module):
 
         self.emb_ff = nn.Linear(self.embed_dim, self.ff_dim)
         self.ff_emb = nn.Linear(self.ff_dim, self.embed_dim)
-        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
 
@@ -381,7 +362,6 @@ class GPT2MLPF(nn.Module):
         x = self.ff_emb(x)
         # [B, Tq, De]
 
-        x = self.dropout(x)
         return x
     
         # [B, Tq, De]
@@ -419,6 +399,25 @@ class GPT2Block(nn.Module):
 
         # [B, Tq, De]
 
+class GPT2LMHead(nn.Module):
+    def __init__(self, embed_dim, embed_wt):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        self.ln = nn.LayerNorm(self.embed_dim)
+        self.embed_wt = embed_wt
+
+    def forward(self, x):
+
+        # [B, Tq, De]
+
+        w = self.embed_wt.weight
+        x = self.ln(x)
+        out = F.linear(x, w)
+        # [B, Tq, De]
+
+        return out
+        
 class GPT2(nn.Module):
     def __init__(self, vocab_size, max_length, embed_dim, ff_dim, num_heads, num_layers):
         super().__init__()
@@ -498,17 +497,14 @@ class GPT2(nn.Module):
         MODEL_URL = 'https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors'
         DIR = 'gpt2'
 
-        # 1. model file
         model_file = download_safetensors(MODEL_URL, DIR)
 
-        # 2. meta nn module
         with torch.device('meta'):
             model = cls(**config)
 
-        # 3. embeddings
         embedding_map = {
-            'wte.weight':      'embedding.tok_embed.weight',
-            'wpe.weight':      'embedding.pos_embed.weight'
+            'wte.weight':      'embed.tok_embed.weight',
+            'wpe.weight':      'embed.pos_embed.weight'
         }
         lm_head_map = {
             'ln_f.weight':     'lm_head.ln.weight',
@@ -532,12 +528,10 @@ class GPT2(nn.Module):
         for i in range(config['num_layers']):
             all_mappings.update(blocks_map(i))
 
-        # 4. needs T if any 
         needs_T = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
         model = stream_safetensors_to_meta_model(model, model_file, all_mappings, needs_T, torch_dtype, device)
 
-        # return Tokenizer algonside:
         tokenizer = GPT2BPE.gpt2(pretrained=True)
 
         return tokenizer, model
