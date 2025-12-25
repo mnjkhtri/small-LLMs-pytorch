@@ -26,11 +26,11 @@ class GPT2Embedding(nn.Module):
     def W_E_weight(self):
         return self.W_E.weight
 
-    def forward(self, toks, pos):
+    def forward(self, toks, x_pos):
         # toks : [B, T]
         # pos  : [1, T]
         tok = self.W_E(toks)      # [B, T, De]
-        pos = self.W_pos(pos)     # [1, T, De]
+        pos = self.W_pos(x_pos)   # [1, T, De]
         resid = tok + pos         # [B, T, De]
         resid = self.hook_resid_emb(resid)
         return resid
@@ -99,8 +99,8 @@ class GPT2(nn.Module, FromPretrainedMixin, InferenceMixin):
         assert T_total <= self.max_length, "sequence length cant exceed max length"
 
         # positions for the new tokens start after the prefix
-        pos = torch.arange(T_past, T_total, device=toks.device).unsqueeze(0) # [1, T_new]
-        resid = self.embed(toks, pos=pos) # [B, T_new, De]
+        x_pos = torch.arange(T_past, T_total, device=toks.device).unsqueeze(0) # [1, T_new]
+        resid = self.embed(toks, x_pos=x_pos) # [B, T_new, De]
 
         if use_cache and past_key_values is None:
             past_key_values = [None] * self.n_layers # first generation step
@@ -207,8 +207,7 @@ class GPT2MHAttention(nn.Module):
 
     def _get_mask(self, Tp, Tt, device):
         if self.mask.numel() == 0:
-            m = torch.tril(torch.ones(self.max_length, self.max_length, device=device, dtype=torch.bool))
-            self.mask = m.view(1, 1, self.max_length, self.max_length)
+            self.mask = torch.tril(torch.ones(self.max_length, self.max_length, device=device, dtype=torch.bool)).view(1, 1, self.max_length, self.max_length)
         return self.mask[:, :, Tp:Tt, :Tt]
 
     def _split_heads(self, x):
@@ -249,7 +248,7 @@ class GPT2MHAttention(nn.Module):
         attn_mask = self._get_mask(T_past, T_total, resid.device) # [1, 1, T_new, T_total]
 
         att = torch.einsum("bhqd,bhkd->bhqk", q, K) / (self.d_head ** 0.5)  # [B, H, T_new, T_total]
-        att = att.masked_fill(~attn_mask, torch.finfo(att.dtype).min)
+        att = att.masked_fill(~attn_mask, float("-inf"))
         att = self.hook_attn_scores(att)
         att = F.softmax(att, dim=-1)
         att = self.hook_attn_probs(att)
