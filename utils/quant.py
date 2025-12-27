@@ -131,6 +131,6 @@ class TorchAOInt8Linear(nn.Module):
     
 
 QUANT_MAP = {
-    "int8_naive": Int8Linear,       # dequantizes W every forward; simplest correctness baseline
-    "int8": TorchAOInt8Linear       # keeps quantized weight tensor; relies on dispatch for speed
+    "int8_naive": Int8Linear,
+    "int8": TorchAOInt8Linear
 }
